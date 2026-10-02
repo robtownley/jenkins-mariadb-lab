@@ -42,15 +42,15 @@
         mode: "0755"
         checksum: "sha256:b54c87edfe81b9837ef44a4a4f39383dd8df32776e6a18c0743a5d3ece044ac3"
 
-    - name: Configure MariaDB and MaxScale package repositories
+    - name: Configure only the MariaDB 11.4 repository
       ansible.builtin.command:
         argv:
           - /usr/local/sbin/mariadb_repo_setup
           - --mariadb-server-version=mariadb-11.4
-          - --mariadb-maxscale-version=25.10
+          - --skip-maxscale
           - --skip-tools
           - --list
-        creates: /etc/apt/sources.list.d/mariadb.list
+      changed_when: true
 
 - name: Install MariaDB on the three database nodes
   hosts: database
@@ -101,13 +101,24 @@
   any_errors_fatal: true
 
   tasks:
-    - name: Install MaxScale and a database client
+    - name: Install database client and package prerequisites
       ansible.builtin.apt:
         name:
-          - maxscale
           - mariadb-client
+          - xz-utils
         state: present
         update_cache: true
+        lock_timeout: 300
+
+    - name: Download the published MaxScale Ubuntu Noble package
+      ansible.builtin.get_url:
+        url: https://dlm.mariadb.com/4296969/MaxScale/24.02.6/apt/pool/main/m/maxscale/maxscale_24.02.6~noble-1_amd64.deb
+        dest: /var/tmp/maxscale_24.02.6_noble_amd64.deb
+        mode: "0644"
+
+    - name: Install MaxScale with its dependencies
+      ansible.builtin.apt:
+        deb: /var/tmp/maxscale_24.02.6_noble_amd64.deb
         lock_timeout: 300
 
     - name: Keep MaxScale stopped until its configuration is ready
@@ -121,10 +132,10 @@
       register: maxscale_version
       changed_when: false
 
-    - name: Confirm MaxScale 25.10 is installed
+    - name: Confirm MaxScale 24.02.6 is installed
       ansible.builtin.assert:
         that:
-          - "'25.10.' in maxscale_version.stdout"
+          - "'24.02.6' in maxscale_version.stdout"
 
     - name: Report proxy version
       ansible.builtin.debug:
