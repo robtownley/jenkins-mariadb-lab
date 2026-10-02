@@ -1,0 +1,36 @@
+[maxscale]
+threads=2
+admin_host=127.0.0.1
+
+{% for node in ['primary', 'replica1', 'replica2'] %}
+[{{ node }}]
+type=server
+address={{ hostvars[node].ansible_host }}
+port=3306
+protocol=MariaDBBackend
+
+{% endfor %}
+[MariaDB-Monitor]
+type=monitor
+module=mariadbmon
+servers=primary,replica1,replica2
+user=lab_monitor
+password={{ lab_monitor_password }}
+monitor_interval=2s
+auto_failover=false
+auto_rejoin=false
+cooperative_monitoring_locks=none
+
+[ReadWrite-Service]
+type=service
+router=readwritesplit
+servers=primary,replica1,replica2
+user=lab_service
+password={{ lab_service_password }}
+
+[ReadWrite-Listener]
+type=listener
+service=ReadWrite-Service
+protocol=MariaDBClient
+address=0.0.0.0
+port=3306
