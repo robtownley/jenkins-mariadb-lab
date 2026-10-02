@@ -1,0 +1,296 @@
+---
+- name: Configure the three MariaDB servers
+  hosts: database
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Configure unique server IDs and replication settings
+      ansible.builtin.copy:
+        dest: /etc/mysql/mariadb.conf.d/60-lab.cnf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [mariadb]
+          bind_address=0.0.0.0
+          skip_name_resolve=1
+          server_id={{ {'primary': 1, 'replica1': 2, 'replica2': 3}[inventory_hostname] }}
+          log_bin=/var/lib/mysql/mariadb-bin
+          relay_log=/var/lib/mysql/mariadb-relay
+          binlog_format=ROW
+          log_slave_updates=1
+          gtid_strict_mode=1
+          gtid_domain_id=0
+          read_only={{ 0 if inventory_hostname == 'primary' else 1 }}
+          sync_binlog=1
+          innodb_flush_log_at_trx_commit=1
+          binlog_expire_logs_seconds=604800
+          innodb_buffer_pool_size=512M
+          max_connections=100
+      notify: Restart MariaDB
+
+    - name: Apply settings before creating accounts
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
+    - name: Restart MariaDB
+      ansible.builtin.systemd_service:
+        name: mariadb
+        state: restarted
+
+
+- name: Create accounts and the demo database on the primary
+  hosts: primary
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+
+  tasks:
+    - name: Confirm Jenkins supplied the expected passwords
+      ansible.builtin.assert:
+        that:
+          - lab_repl_password is match('^[0-9a-fA-F]{32}$')
+          - lab_monitor_password is match('^[0-9a-fA-F]{32}$')
+          - lab_service_password is match('^[0-9a-fA-F]{32}$')
+          - lab_app_password is match('^[0-9a-fA-F]{32}$')
+        fail_msg: "Check the four Jenkins secret-text credentials."
+      no_log: true
+
+    - name: Create replication accounts for each replica IP
+      community.mysql.mysql_user:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        name: lab_repl
+        host: "{{ hostvars[item].ansible_host }}"
+        password: "{{ lab_repl_password }}"
+        priv: "*.*:REPLICATION SLAVE"
+        state: present
+      loop:
+        - replica1
+        - replica2
+      no_log: true
+
+    - name: Create the MaxScale monitoring account
+      community.mysql.mysql_user:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        name: lab_monitor
+        host: "{{ hostvars['maxscale'].ansible_host }}"
+        password: "{{ lab_monitor_password }}"
+        priv: "*.*:REPLICA MONITOR"
+        state: present
+      no_log: true
+
+    - name: Create the MaxScale authentication service account
+      community.mysql.mysql_user:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        name: lab_service
+        host: "{{ hostvars['maxscale'].ansible_host }}"
+        password: "{{ lab_service_password }}"
+        priv:
+          "mysql.*": "SELECT"
+          "*.*": "SHOW DATABASES"
+        state: present
+      no_log: true
+
+    - name: Create the demo database
+      community.mysql.mysql_db:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        name: lab
+        state: present
+
+    - name: Create the demo application account
+      community.mysql.mysql_user:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        name: lab_app
+        host: "%"
+        password: "{{ lab_app_password }}"
+        priv: "lab.*:SELECT,INSERT,UPDATE,DELETE"
+        state: present
+      no_log: true
+
+    - name: Create a table for pipeline verification
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: |
+          CREATE TABLE IF NOT EXISTS lab.pipeline_checks (
+            marker VARCHAR(200) PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )
+
+
+- name: Establish and verify replica connections
+  hosts: replica1:replica2
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+
+  tasks:
+    - name: Inspect existing replication configuration
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: existing_replication
+
+    - name: Confirm an existing channel points to our primary
+      ansible.builtin.assert:
+        that:
+          - existing_replication.query_result[0][0].Master_Host == hostvars['primary'].ansible_host
+        fail_msg: "Replica points elsewhere; refusing to reconfigure it automatically."
+      when: existing_replication.query_result[0] | length > 0
+
+    - name: Inspect application databases before initialising a new replica
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: |
+          SELECT COUNT(*) AS database_count
+          FROM information_schema.SCHEMATA
+          WHERE SCHEMA_NAME NOT IN (
+            'mysql', 'information_schema', 'performance_schema', 'sys'
+          )
+      register: existing_databases
+      when: existing_replication.query_result[0] | length == 0
+
+    - name: Require an empty application database set for initial bootstrap
+      ansible.builtin.assert:
+        that:
+          - existing_databases.query_result[0][0].database_count | int == 0
+        fail_msg: "This replica contains application databases and needs a proper backup/restore seed."
+      when: existing_replication.query_result[0] | length == 0
+
+    - name: Configure the new replica using MariaDB GTID
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: changeprimary
+        primary_host: "{{ hostvars['primary'].ansible_host }}"
+        primary_user: lab_repl
+        primary_password: "{{ lab_repl_password }}"
+        primary_port: 3306
+        primary_use_gtid: replica_pos
+      when: existing_replication.query_result[0] | length == 0
+      no_log: true
+
+    - name: Start replication
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: startreplica
+
+    - name: Wait for both replication threads
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: replication_status
+      until:
+        - replication_status.query_result[0] | length > 0
+        - replication_status.query_result[0][0].Slave_IO_Running == 'Yes'
+        - replication_status.query_result[0][0].Slave_SQL_Running == 'Yes'
+      retries: 30
+      delay: 2
+
+    - name: Wait for the application table to replicate
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: |
+          SELECT COUNT(*) AS table_count
+          FROM information_schema.TABLES
+          WHERE TABLE_SCHEMA = 'lab'
+          AND TABLE_NAME = 'pipeline_checks'
+      register: replicated_table
+      until: replicated_table.query_result[0][0].table_count | int == 1
+      retries: 30
+      delay: 2
+
+    - name: Report replication health
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: IO=Yes, SQL=Yes"
+
+
+- name: Configure MaxScale and test a write through the proxy
+  hosts: proxy
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+
+  tasks:
+    - name: Write the MaxScale configuration
+      ansible.builtin.template:
+        src: templates/maxscale.cnf.j2
+        dest: /etc/maxscale.cnf
+        owner: root
+        group: maxscale
+        mode: "0640"
+      notify: Restart MaxScale
+      no_log: true
+
+    - name: Apply configuration changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start MaxScale
+      ansible.builtin.systemd_service:
+        name: maxscale
+        enabled: true
+        state: started
+
+    - name: Wait for the database listener
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 3306
+        timeout: 60
+
+    - name: Insert this build's marker through MaxScale
+      community.mysql.mysql_query:
+        login_host: 127.0.0.1
+        login_port: 3306
+        login_user: lab_app
+        login_password: "{{ lab_app_password }}"
+        config_file: ""
+        query: |
+          INSERT INTO lab.pipeline_checks (marker)
+          VALUES (%s)
+          ON DUPLICATE KEY UPDATE marker = VALUES(marker)
+        positional_args:
+          - "{{ lab_test_marker }}"
+      register: proxy_write
+      until: proxy_write is succeeded
+      retries: 30
+      delay: 2
+      no_log: true
+
+    - name: Report successful proxy write
+      ansible.builtin.debug:
+        msg: "Write through MaxScale succeeded: {{ lab_test_marker }}"
+
+  handlers:
+    - name: Restart MaxScale
+      ansible.builtin.systemd_service:
+        name: maxscale
+        state: restarted
+
+
+- name: Verify the proxy write reached all database nodes
+  hosts: database
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+
+  tasks:
+    - name: Wait for the marker on this database node
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: |
+          SELECT COUNT(*) AS marker_count
+          FROM lab.pipeline_checks
+          WHERE marker = %s
+        positional_args:
+          - "{{ lab_test_marker }}"
+      register: marker_result
+      until: marker_result.query_result[0][0].marker_count | int == 1
+      retries: 30
+      delay: 2
+
+    - name: Report verified data
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} contains {{ lab_test_marker }}"
