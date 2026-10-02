@@ -17,7 +17,12 @@
 
     - name: Gather server facts
       ansible.builtin.setup:
-
+      
+    - name: Remove the previous combined repository configuration
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/mariadb.list
+        state: absent
+        
     - name: Install repository prerequisites and database Python driver
       ansible.builtin.apt:
         name:
