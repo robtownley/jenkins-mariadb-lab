@@ -8,3 +8,5 @@ nodes.json
 inventory.ini
 *.pem
 *.key
+inventory.json
+lab-known-hosts
