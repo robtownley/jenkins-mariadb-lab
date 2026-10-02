@@ -1,0 +1,10 @@
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+plan.txt
+nodes.json
+inventory.ini
+*.pem
+*.key
