@@ -1,0 +1,126 @@
+---
+- name: Prepare all lab servers
+  hosts: all
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Wait for SSH and Python
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 600
+
+    - name: Wait for first-boot configuration to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+
+    - name: Gather server facts
+      ansible.builtin.setup:
+
+    - name: Install repository prerequisites and database Python driver
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - apt-transport-https
+          - python3-pymysql
+        state: present
+        update_cache: true
+        lock_timeout: 300
+
+    - name: Download verified MariaDB repository setup tool
+      ansible.builtin.get_url:
+        url: https://r.mariadb.com/downloads/mariadb_repo_setup
+        dest: /usr/local/sbin/mariadb_repo_setup
+        mode: "0755"
+        checksum: "sha256:b54c87edfe81b9837ef44a4a4f39383dd8df32776e6a18c0743a5d3ece044ac3"
+
+    - name: Configure MariaDB and MaxScale package repositories
+      ansible.builtin.command:
+        argv:
+          - /usr/local/sbin/mariadb_repo_setup
+          - --mariadb-server-version=mariadb-11.4
+          - --mariadb-maxscale-version=25.10
+          - --skip-tools
+          - --list
+        creates: /etc/apt/sources.list.d/mariadb.list
+
+- name: Install MariaDB on the three database nodes
+  hosts: database
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Install MariaDB packages
+      ansible.builtin.apt:
+        name:
+          - mariadb-server
+          - mariadb-client
+          - mariadb-backup
+        state: present
+        update_cache: true
+        lock_timeout: 300
+
+    - name: Enable and start MariaDB
+      ansible.builtin.systemd_service:
+        name: mariadb
+        enabled: true
+        state: started
+
+    - name: Read the installed server version
+      ansible.builtin.command:
+        argv:
+          - mariadb
+          - --batch
+          - --skip-column-names
+          - --execute
+          - SELECT VERSION();
+      register: server_version
+      changed_when: false
+
+    - name: Confirm MariaDB 11.4 is running
+      ansible.builtin.assert:
+        that:
+          - server_version.stdout.startswith('11.4.')
+        fail_msg: "Unexpected MariaDB version: {{ server_version.stdout }}"
+
+    - name: Report database version
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ server_version.stdout }}"
+
+- name: Install MaxScale on the proxy
+  hosts: proxy
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Install MaxScale and a database client
+      ansible.builtin.apt:
+        name:
+          - maxscale
+          - mariadb-client
+        state: present
+        update_cache: true
+        lock_timeout: 300
+
+    - name: Keep MaxScale stopped until its configuration is ready
+      ansible.builtin.systemd_service:
+        name: maxscale
+        state: stopped
+        enabled: false
+
+    - name: Read MaxScale version
+      ansible.builtin.command: maxscale --version
+      register: maxscale_version
+      changed_when: false
+
+    - name: Confirm MaxScale 25.10 is installed
+      ansible.builtin.assert:
+        that:
+          - "'25.10.' in maxscale_version.stdout"
+
+    - name: Report proxy version
+      ansible.builtin.debug:
+        msg: "{{ maxscale_version.stdout }}"
