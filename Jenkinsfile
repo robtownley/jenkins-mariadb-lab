@@ -136,6 +136,39 @@ pipeline {
                 '''
             }
         }
+        stage('Configure and verify topology') {
+            when {
+                expression { params.ACTION == 'APPLY' }
+            }
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'mariadb-lab-repl-password',
+                        variable: 'LAB_REPL_PASSWORD'
+                    ),
+                    string(
+                        credentialsId: 'mariadb-lab-monitor-password',
+                        variable: 'LAB_MONITOR_PASSWORD'
+                    ),
+                    string(
+                        credentialsId: 'mariadb-lab-service-password',
+                        variable: 'LAB_SERVICE_PASSWORD'
+                    ),
+                    string(
+                        credentialsId: 'mariadb-lab-app-password',
+                        variable: 'LAB_APP_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                            -i inventory.json \
+                            ansible/configure.yml
+                    '''
+                }
+            }
+        }
     }
 
     post {
