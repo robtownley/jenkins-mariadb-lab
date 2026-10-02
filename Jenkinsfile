@@ -122,6 +122,20 @@ pipeline {
                 archiveArtifacts artifacts: 'nodes.json'
             }
         }
+        stage('Install database software') {
+            when {
+                expression { params.ACTION == 'APPLY' }
+            }
+            steps {
+                sh '''
+                    python3 scripts/make_inventory.py
+
+                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                        -i inventory.json \
+                        ansible/install.yml
+                '''
+            }
+        }
     }
 
     post {
