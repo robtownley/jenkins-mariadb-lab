@@ -4,16 +4,27 @@
   become: true
   any_errors_fatal: true
   tasks:
+    - name: Initialize the Jenkins seed decision
+      tags: [seed_plan]
+      ansible.builtin.copy:
+        dest: '{{ playbook_dir }}/../seed-plan.json'
+        mode: '0600'
+        content: '{"needs_seed": false, "source": null, "targets": []}'
+      delegate_to: localhost
+      become: false
+
     - name: Choose and snapshot a donor only when new replicas exist
       when: groups.get('seed_targets', []) | length > 0
       block:
         - name: Read primary version
+          tags: [seed_plan]
           ansible.builtin.command:
             argv: [mariadb, -N, -B, -e, 'SELECT VERSION()']
           register: primary_seed_version
           changed_when: false
 
         - name: Probe existing replicas for seed eligibility
+          tags: [seed_plan]
           ansible.builtin.script:
             cmd: '../scripts/create_zfs_seed.py probe'
             executable: /usr/bin/python3
@@ -25,10 +36,12 @@
           ignore_unreachable: true
 
         - name: Initialize candidate list
+          tags: [seed_plan]
           ansible.builtin.set_fact:
             seed_candidates: []
 
         - name: Collect healthy compatible replica donors
+          tags: [seed_plan]
           ansible.builtin.set_fact:
             seed_candidates: '{{ seed_candidates + [item.item] }}'
           loop: '{{ donor_probes.results | default([]) }}'
@@ -42,6 +55,7 @@
             label: '{{ item.item }}'
 
         - name: Inspect candidate availability in MaxScale
+          tags: [seed_plan]
           ansible.builtin.command:
             argv: [maxctrl, api, get, 'servers/{{ item }}']
           delegate_to: maxscale
@@ -51,6 +65,7 @@
           failed_when: false
 
         - name: Report the MaxScale result for each candidate
+          tags: [seed_plan]
           ansible.builtin.debug:
             msg: >-
               {{ item.item }}: MaxScale rc={{ item.rc | default(-1) }};
@@ -61,10 +76,12 @@
             label: '{{ item.item }}'
 
         - name: Reset the available donor list
+          tags: [seed_plan]
           ansible.builtin.set_fact:
             available_donors: []
 
         - name: Keep only running replicas not already administratively isolated
+          tags: [seed_plan]
           ansible.builtin.set_fact:
             available_donors: '{{ available_donors + [item.item] }}'
           loop: '{{ proxy_candidates.results | default([]) }}'
@@ -78,21 +95,26 @@
             label: '{{ item.item }}'
 
         - name: Use only available candidates
+          tags: [seed_plan]
           ansible.builtin.set_fact:
             seed_candidates: '{{ available_donors }}'
 
-        - name: Require permission before falling back to the primary
+        - name: Require Jenkins approval before falling back to the primary
+          tags: [seed_plan]
+          when: not (lookup('env', 'SEED_PLAN_ONLY') | default('false', true) | bool)
           ansible.builtin.assert:
             that:
               - seed_candidates | length > 0 or lookup('env', 'ALLOW_PRIMARY_SEED') | default('false', true) | bool
-            fail_msg: 'No eligible donor after database/ZFS and MaxScale checks. Read the candidate rc/state/error above; investigate before permitting primary fallback.'
+            fail_msg: 'No eligible donor after database/ZFS and MaxScale checks. Read the candidate rc/state/error above; Jenkins must approve primary seeding before this execution can continue.'
 
         - name: Record the selected donor
+          tags: [seed_plan]
           ansible.builtin.set_fact:
             seed_source: "{{ seed_candidates[0] if seed_candidates | length > 0 else 'primary' }}"
             seed_method: "{{ 'zfs' if seed_candidates | length > 0 else 'cold' }}"
 
         - name: Probe primary ZFS layout when fallback is permitted
+          tags: [seed_plan]
           ansible.builtin.script:
             cmd: '../scripts/create_zfs_seed.py probe --primary'
             executable: /usr/bin/python3
@@ -101,14 +123,25 @@
           when: seed_source == 'primary'
 
         - name: Use a primary ZFS snapshot if its layout is ready
+          tags: [seed_plan]
           ansible.builtin.set_fact:
             seed_method: "{{ 'zfs' if (primary_probe.stdout | from_json).eligible else 'cold' }}"
           when: seed_source == 'primary'
 
         - name: Log every seed pairing
+          tags: [seed_plan]
           ansible.builtin.debug:
             msg: '{{ item }} seeding from > {{ seed_source }} ({{ seed_method }})'
           loop: "{{ groups['seed_targets'] }}"
+
+        - name: Publish the concrete seeding decision for Jenkins
+          tags: [seed_plan]
+          ansible.builtin.copy:
+            dest: '{{ playbook_dir }}/../seed-plan.json'
+            mode: '0600'
+            content: "{{ {'needs_seed': true, 'source': seed_source, 'method': seed_method, 'targets': groups['seed_targets']} | to_nice_json }}"
+          delegate_to: localhost
+          become: false
 
         - name: Require the donor transfer dataset mount
           ansible.builtin.command:
