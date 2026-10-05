@@ -1,0 +1,192 @@
+---
+- name: Move MariaDB data onto its prepared ZFS mirror
+  hosts: database
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  tasks:
+    - name: Check pool health
+      ansible.builtin.command: zpool list -H -o health data
+      register: pool_health
+      changed_when: false
+      failed_when: pool_health.stdout | trim != 'ONLINE'
+
+    - name: Read MySQL dataset mountpoint
+      ansible.builtin.command:
+        argv:
+          - zfs
+          - get
+          - -H
+          - -o
+          - value
+          - mountpoint
+          - data/mysql
+      register: mysql_mountpoint
+      changed_when: false
+
+    - name: Require the expected staging or final mountpoint
+      ansible.builtin.assert:
+        that:
+          - mysql_mountpoint.stdout | trim in
+            ['/data/mysql-stage', '/var/lib/mysql']
+        fail_msg: "Unexpected dataset mountpoint; refusing migration."
+
+    - name: Check replication before touching a replica
+      ansible.builtin.command:
+        argv:
+          - mariadb
+          - -e
+          - "SHOW SLAVE STATUS\\G"
+      register: replication_before
+      changed_when: false
+      when: inventory_hostname != 'primary'
+
+    - name: Require healthy replication before migration
+      ansible.builtin.assert:
+        that:
+          - replication_before.stdout is
+            search('Slave_IO_Running:\s+Yes')
+          - replication_before.stdout is
+            search('Slave_SQL_Running:\s+Yes')
+        fail_msg: "Replication is unhealthy; refusing migration."
+      when: inventory_hostname != 'primary'
+
+    - name: Copy stopped database and switch the mount
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        test ! -e /var/lib/mysql-before-zfs
+        test -d /var/lib/mysql/mysql
+
+        findmnt -rn -t zfs -S data/mysql -M /data/mysql-stage
+
+        if mountpoint -q /var/lib/mysql; then
+          echo "Original datadir is unexpectedly a mountpoint."
+          exit 1
+        fi
+
+        required=$(du -sb /var/lib/mysql | awk '{print $1}')
+        available=$(zfs get -Hp -o value available data/mysql)
+
+        if (( available < required + 1073741824 )); then
+          echo "Insufficient ZFS space, including 1 GiB headroom."
+          exit 1
+        fi
+
+        systemctl stop mariadb
+
+        if pgrep -x mariadbd >/dev/null; then
+          echo "MariaDB is still running."
+          exit 1
+        fi
+
+        rsync -aHAX --numeric-ids \
+          /var/lib/mysql/ /data/mysql-stage/
+
+        differences=$(rsync -aHAXnc --numeric-ids --itemize-changes \
+          /var/lib/mysql/ /data/mysql-stage/)
+
+        if [[ -n "$differences" ]]; then
+          printf '%s\n' "$differences"
+          echo "Copy verification failed; original data is retained."
+          exit 1
+        fi
+
+        mv /var/lib/mysql /var/lib/mysql-before-zfs
+        mkdir /var/lib/mysql
+
+        zfs set mountpoint=/var/lib/mysql data/mysql
+
+        findmnt -rn -t zfs -S data/mysql -M /var/lib/mysql
+        test -d /var/lib/mysql/mysql
+
+        echo "MYSQL_MIGRATED"
+      args:
+        executable: /bin/bash
+      register: migration
+      changed_when: "'MYSQL_MIGRATED' in migration.stdout"
+      when: mysql_mountpoint.stdout | trim == '/data/mysql-stage'
+
+    - name: Verify the final mount before starting MariaDB
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -rn
+          - -t
+          - zfs
+          - -S
+          - data/mysql
+          - -M
+          - /var/lib/mysql
+      changed_when: false
+
+    - name: Set ownership on dataset roots
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: mysql
+        group: mysql
+      loop:
+        - /var/lib/mysql
+        - /var/lib/mysql/.ibd
+        - /var/lib/mysql/.log
+        - /var/lib/mysql/.tmp
+
+    - name: Create MariaDB systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/mariadb.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Require the ZFS datadir when MariaDB starts
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mariadb.service.d/zfs.conf
+        mode: "0644"
+        content: |
+          [Unit]
+          Requires=zfs-mount.service
+          After=zfs-mount.service
+
+          [Service]
+          ExecStartPre=/usr/bin/findmnt -rn -t zfs -S data/mysql -M /var/lib/mysql
+
+    - name: Start MariaDB with the mount guard
+      ansible.builtin.systemd_service:
+        name: mariadb
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Confirm MariaDB responds
+      ansible.builtin.command:
+        argv:
+          - mariadb
+          - -N
+          - -B
+          - -e
+          - "SELECT 1"
+      register: mysql_ping
+      changed_when: false
+      until: mysql_ping.rc == 0
+      retries: 12
+      delay: 5
+
+    - name: Wait for replica threads to recover
+      ansible.builtin.command:
+        argv:
+          - mariadb
+          - -e
+          - "SHOW SLAVE STATUS\\G"
+      register: replication_after
+      changed_when: false
+      until:
+        - replication_after.stdout is
+          search('Slave_IO_Running:\s+Yes')
+        - replication_after.stdout is
+          search('Slave_SQL_Running:\s+Yes')
+        - replication_after.stdout is
+          search('Seconds_Behind_Master:\s+0\b')
+      retries: 30
+      delay: 5
+      when: inventory_hostname != 'primary'
