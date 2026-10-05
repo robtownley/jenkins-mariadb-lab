@@ -57,7 +57,8 @@
     - name: Require an expected log location
       ansible.builtin.assert:
         that:
-          - current_binlog.stdout | trim in
+          - >-
+            current_binlog.stdout | trim in
             ['/var/lib/mysql/mariadb-bin',
              '/var/lib/mysql/.log/mariadb-bin']
         fail_msg: "Unexpected binlog location; refusing migration."
@@ -203,6 +204,7 @@
       retries: 30
       delay: 5
       when: inventory_hostname != 'primary'
+
     - name: Archive old log files after successful migration
       ansible.builtin.shell: |
         set -euo pipefail
@@ -217,6 +219,7 @@
 
         root = Path("/var/lib/mysql")
         logs = root / ".log"
+        is_replica = "{{ inventory_hostname }}" != "primary"
 
         expected = [
             str(logs / "mariadb-bin"),
@@ -235,11 +238,24 @@
             raise SystemExit("Active log paths are unexpected; no cleanup.")
 
         for name in ("mariadb-bin.index", "mariadb-relay.index"):
-            for entry in (logs / name).read_text().splitlines():
+            index = logs / name
+
+            if not index.is_file():
+                if name == "mariadb-relay.index" and not is_replica:
+                    continue
+                raise SystemExit(f"Required log index is missing: {index}")
+
+            for entry in index.read_text().splitlines():
                 if entry.strip() and not entry.strip().startswith(str(logs) + "/"):
-                    raise SystemExit("Active index has an old reference.")
+                    raise SystemExit(
+                        f"Active index has an old reference: {index}"
+                    )
 
         metadata = root / "relay-log.info"
+
+        if is_replica and not metadata.is_file():
+            raise SystemExit("Required relay metadata is missing.")
+
         if metadata.exists():
             lines = metadata.read_text().splitlines()
             if len(lines) < 2 or not lines[1].startswith(str(logs) + "/"):
@@ -274,10 +290,15 @@
                     opened = os.readlink(fd)
                 except FileNotFoundError:
                     continue
-                if opened in candidate_paths:
-                    raise SystemExit(f"MariaDB still has {opened} open.")
 
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                if opened in candidate_paths:
+                    raise SystemExit(
+                        f"MariaDB still has {opened} open."
+                    )
+
+        stamp = datetime.now(timezone.utc).strftime(
+            "%Y%m%dT%H%M%S%fZ"
+        )
         archive = Path("/var/lib/mysql-log-migration-backup") / stamp
         archive.mkdir(parents=True, mode=0o700)
         archive.parent.chmod(0o700)
