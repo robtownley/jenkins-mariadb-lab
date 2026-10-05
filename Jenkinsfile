@@ -30,6 +30,17 @@ pipeline {
             }
         }
 
+        stage('Check Jenkins hosts updater') {
+            when { expression { params.ACTION != 'PLAN' } }
+            steps {
+                sh '''
+                    set -eu
+                    test -x /usr/local/sbin/update-mariadb-lab-hosts
+                    sudo -n -l /usr/local/sbin/update-mariadb-lab-hosts >/dev/null
+                '''
+            }
+        }
+
         stage('Check AWS identity') {
             steps { sh 'aws sts get-caller-identity' }
         }
@@ -78,7 +89,7 @@ pipeline {
             steps {
                 timeout(time: 30, unit: 'MINUTES') {
                     input(
-                        message: "Review plan.txt and change-summary.txt. Execute ${params.ACTION} with ${params.REPLICA_COUNT ?: '2'} replicas? Removed replicas lose their disks and local snapshots. APPLY may briefly interrupt primary writes during migrations.",
+                        message: "Review plan.txt and change-summary.txt. Execute ${params.ACTION} with ${params.REPLICA_COUNT ?: '2'} replicas? Removed replicas lose their disks and local snapshots. APPLY seeds from a healthy ZFS replica first. Primary seeding requires a separate approval if no suitable replica exists. Primary storage migrations can pause writes.",
                         ok: 'Execute approved plan', submitter: 'rob'
                     )
                 }
@@ -106,6 +117,20 @@ pipeline {
                 }
                 sh 'python3 scripts/make_inventory.py'
                 archiveArtifacts artifacts: 'nodes.json,replicas.txt,database-order.txt'
+            }
+        }
+
+        stage('Update Jenkins hosts entries') {
+            when { expression { params.ACTION != 'PLAN' } }
+            steps {
+                sh '''
+                    set -eu
+                    if [ "$ACTION" = "DESTROY" ]; then
+                        printf '%s\n' '{}' | sudo -n /usr/local/sbin/update-mariadb-lab-hosts
+                    else
+                        sudo -n /usr/local/sbin/update-mariadb-lab-hosts < nodes.json
+                    fi
+                '''
             }
         }
 
@@ -142,9 +167,73 @@ pipeline {
                     sh '''
                         set +x
                         set -eu
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                            -i inventory.json ansible/configure.yml
+                        SEED_PLAN_ONLY=true ALLOW_PRIMARY_SEED=false \
+                            /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                            -i inventory.json ansible/configure.yml --tags seed_plan
                     '''
+                    script {
+                        def primarySeedApproved = false
+                        def seedFields = sh(
+                            returnStdout: true,
+                            script: '''
+                                set +x
+                                python3 - <<'PYSEED'
+import json
+import re
+from pathlib import Path
+plan = json.loads(Path('seed-plan.json').read_text())
+needs_seed = plan.get('needs_seed')
+if not isinstance(needs_seed, bool):
+    raise SystemExit('Invalid seed decision')
+source = plan.get('source') or '-'
+method = plan.get('method') or '-'
+targets = plan.get('targets', [])
+if needs_seed:
+    if not re.fullmatch(r'primary|replica[1-9][0-9]*', source):
+        raise SystemExit('Invalid seed source')
+    if method not in ('zfs', 'cold') or not isinstance(targets, list) or not targets:
+        raise SystemExit('Invalid seed method or targets')
+    if any(not isinstance(node, str) or not re.fullmatch(r'replica[1-9][0-9]*', node) for node in targets):
+        raise SystemExit('Invalid seed target')
+else:
+    source, method, targets = '-', '-', []
+print('true' if needs_seed else 'false')
+print(source)
+print(method)
+print(','.join(targets) if targets else '-')
+PYSEED
+                            '''
+                        ).trim().split('\n')
+                        def seedDecision = [
+                            needs_seed: seedFields[0] == 'true',
+                            source: seedFields[1],
+                            method: seedFields[2],
+                            targets: seedFields[3] == '-' ? [] : seedFields[3].split(',').toList()
+                        ]
+                        if (seedDecision.needs_seed && seedDecision.source == 'primary') {
+                            echo "Primary seed requested for: ${seedDecision.targets.join(', ')}; method=${seedDecision.method}"
+                            timeout(time: 30, unit: 'MINUTES') {
+                                input(
+                                    message: "No suitable replica donor is available. Seed ${seedDecision.targets.join(', ')} from PRIMARY using ${seedDecision.method}? This stops MariaDB on the primary and pauses application writes. A cold copy keeps it stopped during copying; a ZFS snapshot restarts it before transfer.",
+                                    ok: 'Approve primary seeding',
+                                    submitter: 'rob'
+                                )
+                            }
+                            primarySeedApproved = true
+                        } else {
+                            echo(seedDecision.needs_seed
+                                ? "Replica donor selected: ${seedDecision.source}; primary approval is unnecessary."
+                                : 'No fresh replicas require seeding.')
+                        }
+                        withEnv(["ALLOW_PRIMARY_SEED=${primarySeedApproved}", 'SEED_PLAN_ONLY=false']) {
+                            sh '''
+                                set +x
+                                set -eu
+                                /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                                    -i inventory.json ansible/configure.yml
+                            '''
+                        }
+                    }
                 }
             }
         }
@@ -183,12 +272,28 @@ pipeline {
                 '''
             }
         }
+
+        stage('Migrate InnoDB redo to ZFS') {
+            when { expression { params.ACTION == 'APPLY' } }
+            steps {
+                sh '''
+                    set -eu
+                    while IFS= read -r node; do
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                            -i inventory.json ansible/migrate_mysql_redo.yml --limit "$node"
+                    done < database-order.txt
+                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                        -i inventory.json ansible/migrate_mysql_redo.yml --limit replicas
+                '''
+            }
+        }
+
     }
 
     post {
         success { echo "Lab action completed: ${params.ACTION}, replicas=${params.REPLICA_COUNT ?: '2'}" }
         always {
-            sh 'rm -f terraform/tfplan terraform/tfplan.json .seed-transfer/seed.tar.gz'
+            sh 'rm -f terraform/tfplan terraform/tfplan.json .seed-transfer/seed.tar.gz .seed-transfer/seed.zfs seed-plan.json'
         }
     }
 }
