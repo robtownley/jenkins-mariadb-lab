@@ -1,0 +1,162 @@
+---
+- name: Configure hostnames and collect public keys
+  hosts: all
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Preserve our hostname and hosts file across reboots
+      ansible.builtin.copy:
+        dest: /etc/cloud/cloud.cfg.d/99-lab-hostname.cfg
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          #cloud-config
+          preserve_hostname: true
+          manage_etc_hosts: false
+
+    - name: Set the server hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+        use: systemd
+
+    - name: Add every lab node to hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} JENKINS LAB HOSTS"
+        block: |
+          {% for node in groups['all'] | sort %}
+          {{ hostvars[node].ansible_host }} {{ node }}
+          {% endfor %}
+
+    - name: Set the login message
+      ansible.builtin.copy:
+        dest: /etc/motd
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          MariaDB Jenkins Lab
+
+          Host: {{ inventory_hostname }}
+          Role: {{ lab_role }}
+          Private IP: {{ ansible_host }}
+
+          Available nodes:
+          {% for node in groups['all'] | sort %}
+            {{ node }} — {{ hostvars[node].ansible_host }}
+          {% endfor %}
+
+          Hop between nodes as ubuntu:
+            ssh replica1
+            ssh primary
+
+          Managed by Terraform and Ansible.
+
+    - name: Ensure ubuntu has a private SSH directory
+      ansible.builtin.file:
+        path: /home/ubuntu/.ssh
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0700"
+
+    - name: Generate a unique SSH key on this server
+      become_user: ubuntu
+      ansible.builtin.command:
+        argv:
+          - ssh-keygen
+          - -t
+          - ed25519
+          - -f
+          - /home/ubuntu/.ssh/id_ed25519_lab
+          - -N
+          - ""
+          - -C
+          - "lab-hop-{{ inventory_hostname }}"
+        creates: /home/ubuntu/.ssh/id_ed25519_lab
+
+    - name: Read this server's public login key
+      ansible.builtin.slurp:
+        src: /home/ubuntu/.ssh/id_ed25519_lab.pub
+      register: lab_login_key
+
+    - name: Read this server's public SSH host key
+      ansible.builtin.slurp:
+        src: /etc/ssh/ssh_host_ed25519_key.pub
+      register: lab_host_key
+
+
+- name: Distribute public keys and configure SSH hopping
+  hosts: all
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Authorise the lab nodes without removing the EC2 login key
+      ansible.builtin.blockinfile:
+        path: /home/ubuntu/.ssh/authorized_keys
+        create: true
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+        marker: "# {mark} JENKINS LAB LOGIN KEYS"
+        block: |
+          {% for node in groups['all'] | sort %}
+          {{ hostvars[node].lab_login_key.content | b64decode | trim }}
+          {% endfor %}
+
+    - name: Install the lab nodes' known host keys
+      ansible.builtin.blockinfile:
+        path: /home/ubuntu/.ssh/known_hosts
+        create: true
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+        marker: "# {mark} JENKINS LAB HOST KEYS"
+        block: |
+          {% for node in groups['all'] | sort %}
+          {{ node }},{{ hostvars[node].ansible_host }} {{ (hostvars[node].lab_host_key.content | b64decode).split()[:2] | join(' ') }}
+          {% endfor %}
+
+    - name: Configure short-name SSH connections
+      ansible.builtin.blockinfile:
+        path: /home/ubuntu/.ssh/config
+        create: true
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+        insertbefore: BOF
+        marker: "# {mark} JENKINS LAB SSH CONFIG"
+        block: |
+          {% for node in groups['all'] | sort %}
+          Host {{ node }}
+              HostName {{ hostvars[node].ansible_host }}
+              HostKeyAlias {{ node }}
+              User ubuntu
+              IdentityFile /home/ubuntu/.ssh/id_ed25519_lab
+              IdentitiesOnly yes
+              StrictHostKeyChecking yes
+              HostKeyAlgorithms ssh-ed25519
+              UserKnownHostsFile /home/ubuntu/.ssh/known_hosts
+
+          {% endfor %}
+
+    - name: Verify passwordless SSH to every other node
+      become_user: ubuntu
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - ConnectTimeout=10
+          - "{{ item }}"
+          - hostname
+      loop: "{{ groups['all'] | difference([inventory_hostname]) | sort }}"
+      register: ssh_hop
+      changed_when: false
+      failed_when: >
+        ssh_hop.rc != 0 or
+        ssh_hop.stdout | trim != item
