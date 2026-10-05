@@ -1,0 +1,213 @@
+---
+- name: Prepare mirrored ZFS storage
+  hosts: database
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  tasks:
+    - name: Install ZFS and migration tools
+      ansible.builtin.apt:
+        name:
+          - zfsutils-linux
+          - rsync
+        state: present
+        update_cache: true
+        lock_timeout: 300
+
+    - name: Load the ZFS kernel module
+      ansible.builtin.command: modprobe zfs
+      changed_when: false
+
+    - name: Require two distinct Terraform volume IDs
+      ansible.builtin.assert:
+        that:
+          - zfs_volume_ids | length == 2
+          - zfs_volume_ids | unique | length == 2
+
+    - name: Read disk paths and EBS serial numbers
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - --json
+          - --bytes
+          - --nodeps
+          - --output
+          - PATH,SERIAL,SIZE,TYPE
+      register: disk_listing
+      changed_when: false
+
+    - name: Match the Terraform volumes to their disks
+      ansible.builtin.set_fact:
+        mysql_zfs_devices: >-
+          {{
+            (disk_listing.stdout | from_json).blockdevices
+            | selectattr('type', 'equalto', 'disk')
+            | selectattr(
+                'serial',
+                'in',
+                zfs_volume_ids | map('replace', '-', '') | list
+              )
+            | list
+          }}
+
+    - name: Check the selected disk count and sizes
+      ansible.builtin.assert:
+        that:
+          - mysql_zfs_devices | length == 2
+          - mysql_zfs_devices | map(attribute='size') | map('int') | min == 16106127360
+          - mysql_zfs_devices | map(attribute='size') | map('int') | max == 16106127360
+        fail_msg: "Could not identify exactly two 15 GiB Terraform data disks."
+
+    - name: Report selected disks
+      ansible.builtin.debug:
+        var: mysql_zfs_devices
+
+    - name: Check whether the data pool already exists
+      ansible.builtin.command: zpool list -H -o name data
+      register: existing_pool
+      changed_when: false
+      failed_when: existing_pool.rc not in [0, 1]
+
+    - name: Require unused disks before creating a new pool
+      when: existing_pool.rc != 0
+      block:
+        - name: Check for filesystem or partition-table signatures
+          ansible.builtin.command:
+            argv:
+              - wipefs
+              - --no-act
+              - --noheadings
+              - --output
+              - TYPE
+              - "{{ item.path }}"
+          loop: "{{ mysql_zfs_devices }}"
+          register: disk_signatures
+          changed_when: false
+
+        - name: Refuse disks containing existing signatures
+          ansible.builtin.assert:
+            that:
+              - item.stdout | trim == ''
+            fail_msg: >-
+              {{ item.item.path }} already contains a signature.
+              If these are existing ZFS disks, import the pool instead.
+          loop: "{{ disk_signatures.results }}"
+          loop_control:
+            label: "{{ item.item.path }}"
+
+        - name: Check for mounted filesystems on the selected disks
+          ansible.builtin.command:
+            argv:
+              - lsblk
+              - --noheadings
+              - --output
+              - MOUNTPOINTS
+              - "{{ item.path }}"
+          loop: "{{ mysql_zfs_devices }}"
+          register: disk_mounts
+          changed_when: false
+
+        - name: Refuse mounted disks
+          ansible.builtin.assert:
+            that:
+              - item.stdout | trim == ''
+          loop: "{{ disk_mounts.results }}"
+          loop_control:
+            label: "{{ item.item.path }}"
+
+        - name: Create the mirrored data pool
+          ansible.builtin.command:
+            argv:
+              - zpool
+              - create
+              - -o
+              - ashift=12
+              - -o
+              - cachefile=/etc/zfs/zpool.cache
+              - -O
+              - mountpoint=/data
+              - -O
+              - compression=lz4
+              - -O
+              - atime=off
+              - data
+              - mirror
+              - "{{ mysql_zfs_devices[0].path }}"
+              - "{{ mysql_zfs_devices[1].path }}"
+
+    - name: Create the backup and staged MySQL datasets if missing
+      ansible.builtin.shell: |
+        set -eu
+        if ! zfs list -H -o name {{ item.name | quote }} >/dev/null 2>&1; then
+          zfs create \
+            -o mountpoint={{ item.mountpoint | quote }} \
+            -o recordsize={{ item.recordsize | quote }} \
+            {{ item.name | quote }}
+          echo CREATED
+        fi
+      loop:
+        - name: data/backup_source
+          mountpoint: /data/backup_source
+          recordsize: 128K
+        - name: data/mysql
+          mountpoint: /data/mysql-stage
+          recordsize: 16K
+      register: dataset_creation
+      changed_when: "'CREATED' in dataset_creation.stdout"
+
+    - name: Read the current MySQL dataset mountpoint
+      ansible.builtin.command:
+        argv:
+          - zfs
+          - get
+          - -H
+          - -o
+          - value
+          - mountpoint
+          - data/mysql
+      register: mysql_mountpoint
+      changed_when: false
+
+    - name: Confirm the MySQL dataset is staged or already migrated
+      ansible.builtin.assert:
+        that:
+          - mysql_mountpoint.stdout in ['/data/mysql-stage', '/var/lib/mysql']
+
+    - name: Create child datasets while storage is still staged
+      when: mysql_mountpoint.stdout == '/data/mysql-stage'
+      ansible.builtin.shell: |
+        set -eu
+        if ! zfs list -H -o name {{ item.name | quote }} >/dev/null 2>&1; then
+          zfs create \
+            -o recordsize={{ item.recordsize | quote }} \
+            {{ item.name | quote }}
+          echo CREATED
+        fi
+      loop:
+        - name: data/mysql/.ibd
+          recordsize: 16K
+        - name: data/mysql/.log
+          recordsize: 128K
+        - name: data/mysql/.tmp
+          recordsize: 128K
+      register: child_creation
+      changed_when: "'CREATED' in child_creation.stdout"
+
+    - name: Display pool health
+      ansible.builtin.command: zpool status data
+      register: pool_status
+      changed_when: false
+
+    - name: Report pool health
+      ansible.builtin.debug:
+        msg: "{{ pool_status.stdout_lines }}"
+
+    - name: Display dataset layout
+      ansible.builtin.command: zfs list -r data
+      register: dataset_status
+      changed_when: false
+
+    - name: Report dataset layout
+      ansible.builtin.debug:
+        msg: "{{ dataset_status.stdout_lines }}"
