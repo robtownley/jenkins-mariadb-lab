@@ -40,6 +40,8 @@ pipeline {
             steps {
                 dir('terraform') {
                     sh '''
+                        set -eu
+
                         terraform init -no-color
                         terraform fmt
                         terraform validate -no-color
@@ -57,6 +59,8 @@ pipeline {
             steps {
                 dir('terraform') {
                     sh '''
+                        set -eu
+
                         PLAN_MODE=""
 
                         if [ "$ACTION" = "DESTROY" ]; then
@@ -83,7 +87,7 @@ pipeline {
             steps {
                 timeout(time: 30, unit: 'MINUTES') {
                     input(
-                        message: "Review plan.txt. Execute ${params.ACTION} for the MariaDB lab?",
+                        message: "Review plan.txt. Execute ${params.ACTION}? APPLY also configures MariaDB and migrates any remaining datadirs to ZFS, briefly interrupting primary writes.",
                         ok: 'Execute approved plan',
                         submitter: 'rob'
                     )
@@ -98,6 +102,8 @@ pipeline {
             steps {
                 dir('terraform') {
                     sh '''
+                        set -eu
+
                         terraform apply \
                             -no-color \
                             -lock-timeout=60s \
@@ -114,6 +120,8 @@ pipeline {
             steps {
                 dir('terraform') {
                     sh '''
+                        set -eu
+
                         terraform output -no-color
                         terraform output -json nodes > ../nodes.json
                     '''
@@ -122,12 +130,15 @@ pipeline {
                 archiveArtifacts artifacts: 'nodes.json'
             }
         }
+
         stage('Install database software') {
             when {
                 expression { params.ACTION == 'APPLY' }
             }
             steps {
                 sh '''
+                    set -eu
+
                     python3 scripts/make_inventory.py
 
                     /opt/jenkins-mariadb-venv/bin/ansible-playbook \
@@ -136,30 +147,37 @@ pipeline {
                 '''
             }
         }
+
         stage('Prepare ZFS mirrors') {
             when {
                 expression { params.ACTION == 'APPLY' }
             }
             steps {
                 sh '''
+                    set -eu
+
                     /opt/jenkins-mariadb-venv/bin/ansible-playbook \
                         -i inventory.json \
                         ansible/prepare_zfs.yml
                 '''
             }
         }
+
         stage('Configure hostnames and SSH hopping') {
             when {
                 expression { params.ACTION == 'APPLY' }
             }
             steps {
                 sh '''
+                    set -eu
+
                     /opt/jenkins-mariadb-venv/bin/ansible-playbook \
                         -i inventory.json \
                         ansible/node_access.yml
                 '''
             }
         }
+
         stage('Configure and verify topology') {
             when {
                 expression { params.ACTION == 'APPLY' }
@@ -185,6 +203,7 @@ pipeline {
                 ]) {
                     sh '''
                         set +x
+                        set -eu
 
                         /opt/jenkins-mariadb-venv/bin/ansible-playbook \
                             -i inventory.json \
@@ -193,12 +212,49 @@ pipeline {
                 }
             }
         }
+
+        stage('Migrate MariaDB to ZFS') {
+            when {
+                expression { params.ACTION == 'APPLY' }
+            }
+            steps {
+                sh '''
+                    set -eu
+
+                    for node in replica1 replica2 primary; do
+                        echo "Checking ZFS migration on $node"
+
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                            -i inventory.json \
+                            ansible/migrate_mysql_zfs.yml \
+                            --limit "$node"
+                    done
+                '''
+            }
+        }
+
+        stage('Verify replicas after migration') {
+            when {
+                expression { params.ACTION == 'APPLY' }
+            }
+            steps {
+                sh '''
+                    set -eu
+
+                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                        -i inventory.json \
+                        ansible/migrate_mysql_zfs.yml \
+                        --limit 'replica1,replica2'
+                '''
+            }
+        }
     }
 
     post {
         success {
-            echo "Infrastructure action completed: ${params.ACTION}"
+            echo "Lab action completed successfully: ${params.ACTION}"
         }
+
         always {
             sh 'rm -f terraform/tfplan'
         }
