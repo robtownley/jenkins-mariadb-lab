@@ -50,6 +50,16 @@
           changed_when: false
           failed_when: false
 
+        - name: Report the MaxScale result for each candidate
+          ansible.builtin.debug:
+            msg: >-
+              {{ item.item }}: MaxScale rc={{ item.rc | default(-1) }};
+              state={{ (item.stdout | from_json).data.attributes.state if item.rc | default(1) == 0 else 'unavailable' }};
+              error={{ item.stderr | default('') | trim }}
+          loop: '{{ proxy_candidates.results | default([]) }}'
+          loop_control:
+            label: '{{ item.item }}'
+
         - name: Reset the available donor list
           ansible.builtin.set_fact:
             available_donors: []
@@ -61,7 +71,7 @@
           when:
             - item.rc | default(1) == 0
             - "'running' in ((item.stdout | from_json).data.attributes.state | lower)"
-            - "'slave' in ((item.stdout | from_json).data.attributes.state | lower)"
+            - "((item.stdout | from_json).data.attributes.state | lower) is search('(^|, *)(slave|replica)(,|$)')"
             - "'maintenance' not in ((item.stdout | from_json).data.attributes.state | lower)"
             - "'drain' not in ((item.stdout | from_json).data.attributes.state | lower)"
           loop_control:
@@ -75,7 +85,7 @@
           ansible.builtin.assert:
             that:
               - seed_candidates | length > 0 or lookup('env', 'ALLOW_PRIMARY_SEED') | default('false', true) | bool
-            fail_msg: 'No healthy ZFS replica donor. Review the reason, then rerun with ALLOW_PRIMARY_SEED enabled to permit a primary copy.'
+            fail_msg: 'No eligible donor after database/ZFS and MaxScale checks. Read the candidate rc/state/error above; investigate before permitting primary fallback.'
 
         - name: Record the selected donor
           ansible.builtin.set_fact:
