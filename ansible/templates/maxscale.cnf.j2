@@ -2,7 +2,7 @@
 threads=2
 admin_host=127.0.0.1
 
-{% for node in ['primary', 'replica1', 'replica2'] %}
+{% for node in groups['database'] | sort %}
 [{{ node }}]
 type=server
 address={{ hostvars[node].ansible_host }}
@@ -13,7 +13,7 @@ protocol=MariaDBBackend
 [MariaDB-Monitor]
 type=monitor
 module=mariadbmon
-servers=primary,replica1,replica2
+servers={{ groups['database'] | sort | join(',') }}
 user=lab_monitor
 password={{ lab_monitor_password }}
 monitor_interval=2s
@@ -24,7 +24,7 @@ cooperative_monitoring_locks=none
 [ReadWrite-Service]
 type=service
 router=readwritesplit
-servers=primary,replica1,replica2
+servers={{ groups['database'] | sort | join(',') }}
 user=lab_service
 password={{ lab_service_password }}
 
