@@ -9,6 +9,8 @@ pipeline {
     }
 
     parameters {
+        booleanParam(name: 'ALLOW_PRIMARY_SEED', defaultValue: false,
+                     description: 'Allow primary downtime for seeding ONLY when no healthy ZFS replica donor exists. Needed for first deployment.')
         choice(name: 'ACTION', choices: ['PLAN', 'APPLY', 'DESTROY'],
                description: 'Preview, provision, or remove the database lab')
         choice(name: 'REPLICA_COUNT', choices: ['2', '1', '3', '4', '5', '6'],
@@ -16,6 +18,7 @@ pipeline {
     }
 
     environment {
+        ALLOW_PRIMARY_SEED = "${params.ALLOW_PRIMARY_SEED ?: false}"
         AWS_DEFAULT_REGION = 'eu-west-2'
         TF_IN_AUTOMATION = 'true'
         TF_INPUT = 'false'
@@ -78,7 +81,7 @@ pipeline {
             steps {
                 timeout(time: 30, unit: 'MINUTES') {
                     input(
-                        message: "Review plan.txt and change-summary.txt. Execute ${params.ACTION} with ${params.REPLICA_COUNT ?: '2'} replicas? Removed replicas lose their disks and local snapshots. APPLY may briefly interrupt primary writes during migrations.",
+                        message: "Review plan.txt and change-summary.txt. Execute ${params.ACTION} with ${params.REPLICA_COUNT ?: '2'} replicas? Removed replicas lose their disks and local snapshots. APPLY seeds from a healthy ZFS replica first. Primary seed fallback allowed=${params.ALLOW_PRIMARY_SEED ?: false}; fallback and primary storage migrations pause writes.",
                         ok: 'Execute approved plan', submitter: 'rob'
                     )
                 }
@@ -183,12 +186,28 @@ pipeline {
                 '''
             }
         }
+
+        stage('Migrate InnoDB redo to ZFS') {
+            when { expression { params.ACTION == 'APPLY' } }
+            steps {
+                sh '''
+                    set -eu
+                    while IFS= read -r node; do
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                            -i inventory.json ansible/migrate_mysql_redo.yml --limit "$node"
+                    done < database-order.txt
+                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                        -i inventory.json ansible/migrate_mysql_redo.yml --limit replicas
+                '''
+            }
+        }
+
     }
 
     post {
         success { echo "Lab action completed: ${params.ACTION}, replicas=${params.REPLICA_COUNT ?: '2'}" }
         always {
-            sh 'rm -f terraform/tfplan terraform/tfplan.json .seed-transfer/seed.tar.gz'
+            sh 'rm -f terraform/tfplan terraform/tfplan.json .seed-transfer/seed.tar.gz .seed-transfer/seed.zfs'
         }
     }
 }
