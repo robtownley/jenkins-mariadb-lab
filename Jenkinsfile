@@ -78,7 +78,7 @@ pipeline {
             steps {
                 timeout(time: 30, unit: 'MINUTES') {
                     input(
-                        message: "Review plan.txt and change-summary.txt. Execute ${params.ACTION} with ${params.REPLICA_COUNT ?: '2'} replicas? Removed replicas lose their disks and local snapshots. APPLY seeds from a healthy ZFS replica first. Primary seeding requires a separate approval if no suitable replica exists. Primary storage migrations can pause writes.",
+                        message: "Review plan.txt and change-summary.txt. Execute ${params.ACTION} with ${params.REPLICA_COUNT ?: '2'} replicas? Removed replicas lose their disks and local snapshots. APPLY may briefly interrupt primary writes during migrations.",
                         ok: 'Execute approved plan', submitter: 'rob'
                     )
                 }
@@ -142,39 +142,9 @@ pipeline {
                     sh '''
                         set +x
                         set -eu
-                        SEED_PLAN_ONLY=true ALLOW_PRIMARY_SEED=false \
-                            /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                            -i inventory.json ansible/configure.yml --tags seed_plan
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                            -i inventory.json ansible/configure.yml
                     '''
-                    script {
-                        def primarySeedApproved = false
-                        def seedDecision = new groovy.json.JsonSlurperClassic().parseText(
-                            readFile('seed-plan.json')
-                        )
-                        if (seedDecision.needs_seed && seedDecision.source == 'primary') {
-                            echo "Primary seed requested for: ${seedDecision.targets.join(', ')}; method=${seedDecision.method}"
-                            timeout(time: 30, unit: 'MINUTES') {
-                                input(
-                                    message: "No suitable replica donor is available. Seed ${seedDecision.targets.join(', ')} from PRIMARY using ${seedDecision.method}? This stops MariaDB on the primary and pauses application writes. A cold copy keeps it stopped during copying; a ZFS snapshot restarts it before transfer.",
-                                    ok: 'Approve primary seeding',
-                                    submitter: 'rob'
-                                )
-                            }
-                            primarySeedApproved = true
-                        } else {
-                            echo(seedDecision.needs_seed
-                                ? "Replica donor selected: ${seedDecision.source}; primary approval is unnecessary."
-                                : 'No fresh replicas require seeding.')
-                        }
-                        withEnv(["ALLOW_PRIMARY_SEED=${primarySeedApproved}", 'SEED_PLAN_ONLY=false']) {
-                            sh '''
-                                set +x
-                                set -eu
-                                /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                                    -i inventory.json ansible/configure.yml
-                            '''
-                        }
-                    }
                 }
             }
         }
@@ -213,28 +183,12 @@ pipeline {
                 '''
             }
         }
-
-        stage('Migrate InnoDB redo to ZFS') {
-            when { expression { params.ACTION == 'APPLY' } }
-            steps {
-                sh '''
-                    set -eu
-                    while IFS= read -r node; do
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                            -i inventory.json ansible/migrate_mysql_redo.yml --limit "$node"
-                    done < database-order.txt
-                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                        -i inventory.json ansible/migrate_mysql_redo.yml --limit replicas
-                '''
-            }
-        }
-
     }
 
     post {
         success { echo "Lab action completed: ${params.ACTION}, replicas=${params.REPLICA_COUNT ?: '2'}" }
         always {
-            sh 'rm -f terraform/tfplan terraform/tfplan.json .seed-transfer/seed.tar.gz .seed-transfer/seed.zfs seed-plan.json'
+            sh 'rm -f terraform/tfplan terraform/tfplan.json .seed-transfer/seed.tar.gz'
         }
     }
 }
