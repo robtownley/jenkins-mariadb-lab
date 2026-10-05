@@ -155,14 +155,14 @@
             required=$(du -sb /var/lib/mysql | awk '{print $1}')
             available=$(zfs get -Hp -o value available data/backup_source)
             test "$available" -gt "$((required * 3 + 1073741824))"
-          delegate_to: '{{ seed_source }}'
+          delegate_to: "{{ seed_source | default('primary') }}"
           changed_when: false
 
         - name: Clear the previous donor transfer workspace
           ansible.builtin.file:
             path: /data/backup_source/.jenkins-seed-current
             state: absent
-          delegate_to: '{{ seed_source }}'
+          delegate_to: "{{ seed_source | default('primary') }}"
 
         - name: Prepare a replica ZFS stream with traffic isolation
           when: seed_method == 'zfs' and seed_source != 'primary'
@@ -207,7 +207,7 @@
               ansible.builtin.script:
                 cmd: '../scripts/create_zfs_seed.py snapshot'
                 executable: /usr/bin/python3
-              delegate_to: '{{ seed_source }}'
+              delegate_to: "{{ seed_source | default('primary') }}"
               register: zfs_seed
 
             - name: Capture the snapshot manifest
@@ -218,7 +218,7 @@
               community.mysql.mysql_query:
                 login_unix_socket: /run/mysqld/mysqld.sock
                 query: SHOW SLAVE STATUS
-              delegate_to: '{{ seed_source }}'
+              delegate_to: "{{ seed_source | default('primary') }}"
               register: recovered_donor
               until:
                 - recovered_donor.query_result[0] | length == 1
@@ -294,7 +294,7 @@
           ansible.builtin.script:
             cmd: '../scripts/create_zfs_seed.py send'
             executable: /usr/bin/python3
-          delegate_to: '{{ seed_source }}'
+          delegate_to: "{{ seed_source | default('primary') }}"
           when: seed_method == 'zfs'
 
         - name: Create a private Jenkins transfer directory
@@ -310,7 +310,7 @@
             src: "/data/backup_source/.jenkins-seed-current/{{ 'seed.zfs' if seed_method == 'zfs' else 'seed.tar.gz' }}"
             dest: "{{ playbook_dir }}/../.seed-transfer/{{ 'seed.zfs' if seed_method == 'zfs' else 'seed.tar.gz' }}"
             flat: true
-          delegate_to: '{{ seed_source }}'
+          delegate_to: "{{ seed_source | default('primary') }}"
           no_log: true
 
 - name: Restore only fresh replicas from the selected donor
