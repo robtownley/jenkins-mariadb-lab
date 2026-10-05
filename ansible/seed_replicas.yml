@@ -331,10 +331,6 @@
         set -eu
         test ! -e /var/lib/mysql-before-seed
         if mountpoint -q /var/lib/mysql; then exit 1; fi
-        if zfs list -H data/jenkins-seed-receive >/dev/null 2>&1; then
-          echo 'Previous receive dataset exists: inspect the interrupted restore.'
-          exit 1
-        fi
       changed_when: false
 
     - name: Require matching MariaDB version
@@ -348,6 +344,43 @@
         that:
           - destination_version.stdout.split('-')[0] == manifest.version.split('-')[0]
           - manifest.gtid is match('^[0-9]+-[0-9]+-[0-9]+(,[0-9]+-[0-9]+-[0-9]+)*$')
+
+    - name: Discard an interrupted temporary receive before restoration has started
+      ansible.builtin.shell: |
+        python3 - <<'PYRECEIVE'
+        import subprocess
+        from pathlib import Path
+        dataset = 'data/jenkins-seed-receive'
+        if Path('/var/lib/mysql-before-seed').exists():
+            raise SystemExit('Restoration has started; refusing temporary receive cleanup.')
+        result = subprocess.run(['zfs', 'list', '-H', '-r', '-o', 'name,mountpoint', dataset],
+                                text=True, capture_output=True)
+        if result.returncode:
+            if 'does not exist' in result.stderr:
+                print('NO_TEMP_RECEIVE')
+                raise SystemExit(0)
+            raise SystemExit(result.stderr)
+        active = subprocess.check_output(['mariadb', '-N', '-B', '-e', 'SELECT @@datadir'],
+                                         text=True).strip().rstrip('/')
+        if active != '/var/lib/mysql':
+            raise SystemExit('Unexpected active datadir; refusing cleanup.')
+        allowed = {dataset, dataset + '/.ibd', dataset + '/.log', dataset + '/.tmp'}
+        for line in result.stdout.splitlines():
+            name, mountpoint = line.split('\t', 1)
+            if name not in allowed:
+                raise SystemExit('Unexpected descendant; refusing cleanup: ' + name)
+            prefixes = ['/var/tmp/.jenkins-seed-current/backup', '/data/jenkins-seed-receive']
+            if mountpoint != 'none' and not any(mountpoint == prefix or mountpoint.startswith(prefix + '/') for prefix in prefixes):
+                raise SystemExit('Unexpected receive mountpoint; refusing cleanup: ' + mountpoint)
+        readonly = subprocess.check_output(['zfs', 'get', '-H', '-o', 'value', 'readonly', dataset],
+                                           text=True).strip()
+        if readonly != 'on':
+            raise SystemExit('Temporary receive is writable; refusing cleanup.')
+        subprocess.run(['zfs', 'destroy', '-r', dataset], check=True)
+        print('DISCARDED_TEMP_RECEIVE')
+        PYRECEIVE
+      register: previous_receive
+      changed_when: "'DISCARDED_TEMP_RECEIVE' in previous_receive.stdout"
 
     - name: Install rsync
       ansible.builtin.apt:
@@ -391,10 +424,16 @@
           < /var/tmp/.jenkins-seed-current/seed.zfs
         zfs set mountpoint=/var/tmp/.jenkins-seed-current/backup data/jenkins-seed-receive
         zfs set canmount=on data/jenkins-seed-receive
-        zfs mount data/jenkins-seed-receive
+        if [ "$(zfs get -H -o value mounted data/jenkins-seed-receive)" != 'yes' ]; then
+          zfs mount data/jenkins-seed-receive
+        fi
+        findmnt -rn -t zfs -S data/jenkins-seed-receive -M /var/tmp/.jenkins-seed-current/backup
         for child in .ibd .log .tmp; do
           zfs set canmount=on "data/jenkins-seed-receive/$child"
-          zfs mount "data/jenkins-seed-receive/$child"
+          if [ "$(zfs get -H -o value mounted "data/jenkins-seed-receive/$child")" != 'yes' ]; then
+            zfs mount "data/jenkins-seed-receive/$child"
+          fi
+          findmnt -rn -t zfs -S "data/jenkins-seed-receive/$child" -M "/var/tmp/.jenkins-seed-current/backup/$child"
         done
 
     - name: Extract a primary cold copy
