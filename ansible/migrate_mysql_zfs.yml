@@ -10,47 +10,50 @@
       ansible.builtin.command: zpool list -H -o health data
       register: pool_health
       changed_when: false
-      failed_when: pool_health.stdout | trim != 'ONLINE'
+      failed_when: pool_health.rc != 0 or pool_health.stdout | trim != 'ONLINE'
 
     - name: Read MySQL dataset mountpoint
       ansible.builtin.command:
-        argv:
-          - zfs
-          - get
-          - -H
-          - -o
-          - value
-          - mountpoint
-          - data/mysql
+        argv: [zfs, get, -H, -o, value, mountpoint, data/mysql]
       register: mysql_mountpoint
       changed_when: false
 
     - name: Require the expected staging or final mountpoint
       ansible.builtin.assert:
         that:
-          - mysql_mountpoint.stdout | trim in
-            ['/data/mysql-stage', '/var/lib/mysql']
-        fail_msg: "Unexpected dataset mountpoint; refusing migration."
+          - mysql_mountpoint.stdout | trim in ['/data/mysql-stage', '/var/lib/mysql']
+        fail_msg: 'Unexpected dataset mountpoint; refusing migration.'
 
-    - name: Check replication before touching a replica
-      ansible.builtin.command:
-        argv:
-          - mariadb
-          - -e
-          - "SHOW SLAVE STATUS\\G"
-      register: replication_before
-      changed_when: false
+    - name: Require healthy replication before touching a replica
       when: inventory_hostname != 'primary'
+      block:
+        - name: Wait for replication to be healthy before migration
+          community.mysql.mysql_query:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            query: SHOW SLAVE STATUS
+          register: replication_before
+          until:
+            - replication_before is succeeded
+            - (replication_before.query_result | default([[]], true))[0] | length == 1
+            - ((replication_before.query_result | default([[]], true))[0] | first | default({})).get('Slave_IO_Running', 'No') == 'Yes'
+            - ((replication_before.query_result | default([[]], true))[0] | first | default({})).get('Slave_SQL_Running', 'No') == 'Yes'
+            - ((replication_before.query_result | default([[]], true))[0] | first | default({})).get('Seconds_Behind_Master') is not none
+            - ((replication_before.query_result | default([[]], true))[0] | first | default({})).get('Seconds_Behind_Master', -1) | int == 0
+            - ((replication_before.query_result | default([[]], true))[0] | first | default({})).get('Last_IO_Errno', -1) | int == 0
+            - ((replication_before.query_result | default([[]], true))[0] | first | default({})).get('Last_SQL_Errno', -1) | int == 0
+          retries: 60
+          delay: 5
+      rescue:
+        - name: Report replication status before migration
+          ansible.builtin.debug:
+            msg:
+              node: '{{ inventory_hostname }}'
+              status: '{{ replication_before.query_result | default([]) }}'
+              query_error: "{{ replication_before.msg | default('') }}"
 
-    - name: Require healthy replication before migration
-      ansible.builtin.assert:
-        that:
-          - replication_before.stdout is
-            search('Slave_IO_Running:\s+Yes')
-          - replication_before.stdout is
-            search('Slave_SQL_Running:\s+Yes')
-        fail_msg: "Replication is unhealthy; refusing migration."
-      when: inventory_hostname != 'primary'
+        - name: Stop before migrating an unhealthy replica
+          ansible.builtin.fail:
+            msg: 'Replication did not become healthy within the retry window. See the status above; datadir migration was not attempted.'
 
     - name: Copy stopped database and switch the mount
       ansible.builtin.shell: |
@@ -110,20 +113,12 @@
 
     - name: Verify the final mount before starting MariaDB
       ansible.builtin.command:
-        argv:
-          - findmnt
-          - -rn
-          - -t
-          - zfs
-          - -S
-          - data/mysql
-          - -M
-          - /var/lib/mysql
+        argv: [findmnt, -rn, -t, zfs, -S, data/mysql, -M, /var/lib/mysql]
       changed_when: false
 
     - name: Set ownership on dataset roots
       ansible.builtin.file:
-        path: "{{ item }}"
+        path: '{{ item }}'
         state: directory
         owner: mysql
         group: mysql
@@ -137,12 +132,12 @@
       ansible.builtin.file:
         path: /etc/systemd/system/mariadb.service.d
         state: directory
-        mode: "0755"
+        mode: '0755'
 
     - name: Require the ZFS datadir when MariaDB starts
       ansible.builtin.copy:
         dest: /etc/systemd/system/mariadb.service.d/zfs.conf
-        mode: "0644"
+        mode: '0644'
         content: |
           [Unit]
           Requires=zfs-mount.service
@@ -162,34 +157,40 @@
 
     - name: Confirm MariaDB responds
       ansible.builtin.command:
-        argv:
-          - mariadb
-          - -N
-          - -B
-          - -e
-          - "SELECT 1"
+        argv: [mariadb, -N, -B, -e, 'SELECT 1']
       register: mysql_ping
       changed_when: false
       until: mysql_ping.rc == 0
       retries: 12
       delay: 5
 
-    - name: Wait for replica threads to recover
-      ansible.builtin.command:
-        argv:
-          - mariadb
-          - -e
-          - "SHOW SLAVE STATUS\\G"
-      register: replication_after
-      changed_when: false
-      until:
-        - replication_after.rc == 0
-        - "'Slave_IO_Running: Yes' in
-           (replication_after.stdout_lines | map('trim') | list)"
-        - "'Slave_SQL_Running: Yes' in
-           (replication_after.stdout_lines | map('trim') | list)"
-        - "'Seconds_Behind_Master: 0' in
-           (replication_after.stdout_lines | map('trim') | list)"
-      retries: 30
-      delay: 5
+    - name: Require healthy replication after migration
       when: inventory_hostname != 'primary'
+      block:
+        - name: Wait for replica threads to recover and catch up
+          community.mysql.mysql_query:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            query: SHOW SLAVE STATUS
+          register: replication_after
+          until:
+            - replication_after is succeeded
+            - (replication_after.query_result | default([[]], true))[0] | length == 1
+            - ((replication_after.query_result | default([[]], true))[0] | first | default({})).get('Slave_IO_Running', 'No') == 'Yes'
+            - ((replication_after.query_result | default([[]], true))[0] | first | default({})).get('Slave_SQL_Running', 'No') == 'Yes'
+            - ((replication_after.query_result | default([[]], true))[0] | first | default({})).get('Seconds_Behind_Master') is not none
+            - ((replication_after.query_result | default([[]], true))[0] | first | default({})).get('Seconds_Behind_Master', -1) | int == 0
+            - ((replication_after.query_result | default([[]], true))[0] | first | default({})).get('Last_IO_Errno', -1) | int == 0
+            - ((replication_after.query_result | default([[]], true))[0] | first | default({})).get('Last_SQL_Errno', -1) | int == 0
+          retries: 60
+          delay: 5
+      rescue:
+        - name: Report replication status after migration
+          ansible.builtin.debug:
+            msg:
+              node: '{{ inventory_hostname }}'
+              status: '{{ replication_after.query_result | default([]) }}'
+              query_error: "{{ replication_after.msg | default('') }}"
+
+        - name: Stop after a failed replication recovery
+          ansible.builtin.fail:
+            msg: 'The ZFS datadir is mounted, but replication did not recover within the retry window. See the status above; inspect this node before proceeding.'
