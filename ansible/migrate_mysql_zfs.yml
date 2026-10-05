@@ -150,6 +150,8 @@
 
           [Service]
           ExecStartPre=/usr/bin/findmnt -rn -t zfs -S data/mysql -M /var/lib/mysql
+          ExecStartPre=/usr/bin/findmnt -rn -t zfs -S data/mysql/.log -M /var/lib/mysql/.log
+          ExecStartPre=/usr/bin/findmnt -rn -t zfs -S data/mysql/.tmp -M /var/lib/mysql/.tmp
 
     - name: Start MariaDB with the mount guard
       ansible.builtin.systemd_service:
