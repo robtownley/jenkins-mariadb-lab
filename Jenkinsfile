@@ -136,6 +136,18 @@ pipeline {
                 '''
             }
         }
+        stage('Configure hostnames and SSH hopping') {
+            when {
+                expression { params.ACTION == 'APPLY' }
+            }
+            steps {
+                sh '''
+                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                        -i inventory.json \
+                        ansible/node_access.yml
+                '''
+            }
+        }
         stage('Configure and verify topology') {
             when {
                 expression { params.ACTION == 'APPLY' }
