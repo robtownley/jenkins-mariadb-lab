@@ -203,3 +203,95 @@
       retries: 30
       delay: 5
       when: inventory_hostname != 'primary'
+    - name: Archive old log files after successful migration
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        python3 <<'PY'
+        import os
+        import re
+        import shutil
+        import subprocess
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        root = Path("/var/lib/mysql")
+        logs = root / ".log"
+
+        expected = [
+            str(logs / "mariadb-bin"),
+            str(logs / "mariadb-bin.index"),
+            str(logs / "mariadb-relay"),
+            str(logs / "mariadb-relay.index"),
+        ]
+
+        actual = subprocess.check_output([
+            "mariadb", "-N", "-B", "-e",
+            "SELECT @@log_bin_basename, @@log_bin_index, "
+            "@@relay_log_basename, @@relay_log_index"
+        ], text=True).strip().split("\t")
+
+        if actual != expected:
+            raise SystemExit("Active log paths are unexpected; no cleanup.")
+
+        for name in ("mariadb-bin.index", "mariadb-relay.index"):
+            for entry in (logs / name).read_text().splitlines():
+                if entry.strip() and not entry.strip().startswith(str(logs) + "/"):
+                    raise SystemExit("Active index has an old reference.")
+
+        metadata = root / "relay-log.info"
+        if metadata.exists():
+            lines = metadata.read_text().splitlines()
+            if len(lines) < 2 or not lines[1].startswith(str(logs) + "/"):
+                raise SystemExit("Relay metadata has an old reference.")
+
+        pattern = re.compile(
+            r"mariadb-(?:bin|relay)\."
+            r"(?:[0-9]+(?:\.idx)?|index|state)"
+        )
+
+        leftovers = sorted(
+            path for path in root.iterdir()
+            if pattern.fullmatch(path.name)
+            and path.is_file()
+            and not path.is_symlink()
+        )
+
+        if not leftovers:
+            print("NO_OLD_LOGS")
+            raise SystemExit(0)
+
+        # Refuse to move any file MariaDB currently has open.
+        pids = subprocess.check_output(
+            ["pgrep", "-x", "mariadbd"], text=True
+        ).split()
+
+        candidate_paths = {str(path) for path in leftovers}
+
+        for pid in pids:
+            for fd in Path(f"/proc/{pid}/fd").iterdir():
+                try:
+                    opened = os.readlink(fd)
+                except FileNotFoundError:
+                    continue
+                if opened in candidate_paths:
+                    raise SystemExit(f"MariaDB still has {opened} open.")
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        archive = Path("/var/lib/mysql-log-migration-backup") / stamp
+        archive.mkdir(parents=True, mode=0o700)
+        archive.parent.chmod(0o700)
+
+        for source in leftovers:
+            shutil.move(str(source), str(archive / source.name))
+
+        print(f"ARCHIVED_OLD_LOGS: {archive}")
+        PY
+      args:
+        executable: /bin/bash
+      register: old_log_cleanup
+      changed_when: "'ARCHIVED_OLD_LOGS:' in old_log_cleanup.stdout"
+
+    - name: Report old log cleanup
+      ansible.builtin.debug:
+        var: old_log_cleanup.stdout
