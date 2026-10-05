@@ -1,41 +1,30 @@
+variable "replica_count" {
+  description = "Desired number of MariaDB replicas"
+  type        = number
+  default     = 2
+  validation {
+    condition     = var.replica_count >= 1 && var.replica_count <= 6 && floor(var.replica_count) == var.replica_count
+    error_message = "replica_count must be a whole number between 1 and 6."
+  }
+}
+
 locals {
   vpc_id        = "vpc-0e108fe4a8ffe3dee"
   subnet_id     = "subnet-0bb1a97785b8ba5a5"
   jenkins_sg_id = "sg-0243f521e59c4d971"
 
-  nodes = {
-    primary  = "mariadb-primary"
-    replica1 = "mariadb-replica-1"
-    replica2 = "mariadb-replica-2"
-    maxscale = "mariadb-maxscale"
+  replicas = {
+    for n in range(1, var.replica_count + 1) : "replica${n}" => "mariadb-replica-${n}"
   }
+  database_nodes = merge({ primary = "mariadb-primary" }, local.replicas)
+  nodes          = merge(local.database_nodes, { maxscale = "mariadb-maxscale" })
 
-  mysql_zfs_disks = {
-    primary-a = {
-      node   = "primary"
-      device = "/dev/sdf"
+  mysql_zfs_disks = merge([
+    for node in keys(local.database_nodes) : {
+      "${node}-a" = { node = node, device = "/dev/sdf" }
+      "${node}-b" = { node = node, device = "/dev/sdg" }
     }
-    primary-b = {
-      node   = "primary"
-      device = "/dev/sdg"
-    }
-    replica1-a = {
-      node   = "replica1"
-      device = "/dev/sdf"
-    }
-    replica1-b = {
-      node   = "replica1"
-      device = "/dev/sdg"
-    }
-    replica2-a = {
-      node   = "replica2"
-      device = "/dev/sdf"
-    }
-    replica2-b = {
-      node   = "replica2"
-      device = "/dev/sdg"
-    }
-  }
+  ]...)
 }
 
 data "aws_subnet" "lab" {
@@ -49,22 +38,18 @@ data "aws_security_group" "jenkins" {
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"]
-
   filter {
     name   = "name"
     values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
   }
-
   filter {
     name   = "architecture"
     values = ["x86_64"]
   }
-
   filter {
     name   = "virtualization-type"
     values = ["hvm"]
   }
-
   filter {
     name   = "state"
     values = ["available"]
@@ -80,7 +65,6 @@ resource "aws_security_group" "maxscale" {
   name        = "jenkins-mariadb-lab-maxscale"
   description = "MaxScale lab access"
   vpc_id      = local.vpc_id
-
   ingress {
     description     = "SSH from Jenkins"
     from_port       = 22
@@ -88,7 +72,6 @@ resource "aws_security_group" "maxscale" {
     protocol        = "tcp"
     security_groups = [local.jenkins_sg_id]
   }
-
   ingress {
     description     = "Database connections from Jenkins"
     from_port       = 3306
@@ -96,24 +79,19 @@ resource "aws_security_group" "maxscale" {
     protocol        = "tcp"
     security_groups = [local.jenkins_sg_id]
   }
-
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
-  tags = {
-    Name = "jenkins-mariadb-lab-maxscale"
-  }
+  tags = { Name = "jenkins-mariadb-lab-maxscale" }
 }
 
 resource "aws_security_group" "database" {
   name        = "jenkins-mariadb-lab-database"
   description = "MariaDB replication and proxy access"
   vpc_id      = local.vpc_id
-
   ingress {
     description     = "SSH from Jenkins"
     from_port       = 22
@@ -121,7 +99,6 @@ resource "aws_security_group" "database" {
     protocol        = "tcp"
     security_groups = [local.jenkins_sg_id]
   }
-
   ingress {
     description = "Replication between database nodes"
     from_port   = 3306
@@ -129,7 +106,6 @@ resource "aws_security_group" "database" {
     protocol    = "tcp"
     self        = true
   }
-
   ingress {
     description     = "Database connections from MaxScale"
     from_port       = 3306
@@ -137,24 +113,19 @@ resource "aws_security_group" "database" {
     protocol        = "tcp"
     security_groups = [aws_security_group.maxscale.id]
   }
-
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
-  tags = {
-    Name = "jenkins-mariadb-lab-database"
-  }
+  tags = { Name = "jenkins-mariadb-lab-database" }
 }
 
 resource "aws_security_group" "lab_ssh" {
   name        = "jenkins-mariadb-lab-internal-ssh"
   description = "SSH between lab nodes"
   vpc_id      = local.vpc_id
-
   ingress {
     description = "SSH from other lab nodes"
     from_port   = 22
@@ -162,65 +133,49 @@ resource "aws_security_group" "lab_ssh" {
     protocol    = "tcp"
     self        = true
   }
-
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
-  tags = {
-    Name = "jenkins-mariadb-lab-internal-ssh"
-  }
+  tags = { Name = "jenkins-mariadb-lab-internal-ssh" }
 }
 
 resource "aws_instance" "node" {
-  for_each = local.nodes
-
+  for_each                    = local.nodes
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = "t3.small"
   subnet_id                   = local.subnet_id
   associate_public_ip_address = true
   key_name                    = aws_key_pair.lab.key_name
-
   vpc_security_group_ids = [
-    each.key == "maxscale"
-    ? aws_security_group.maxscale.id
-    : aws_security_group.database.id,
+    each.key == "maxscale" ? aws_security_group.maxscale.id : aws_security_group.database.id,
     aws_security_group.lab_ssh.id
   ]
-
   root_block_device {
-     volume_size           = 20
-     volume_type           = "gp3"
-     encrypted             = true
-     delete_on_termination = true
-
-     tags = {
-       Project = "mariadb-jenkins-lab"
-       Name    = "${each.value}-root"
-     }
+    volume_size           = 20
+    volume_type           = "gp3"
+    encrypted             = true
+    delete_on_termination = true
+    tags = {
+      Project = "mariadb-jenkins-lab"
+      Name    = "${each.value}-root"
+    }
   }
-
   metadata_options {
     http_endpoint = "enabled"
     http_tokens   = "required"
   }
-
   credit_specification {
     cpu_credits = "standard"
   }
-
   tags = {
     Name = each.value
     Role = each.key
   }
-
-
   lifecycle {
     ignore_changes = [ami]
-
     precondition {
       condition = (
         data.aws_subnet.lab.vpc_id == local.vpc_id &&
@@ -232,13 +187,11 @@ resource "aws_instance" "node" {
 }
 
 resource "aws_ebs_volume" "mysql_zfs" {
-  for_each = local.mysql_zfs_disks
-
+  for_each          = local.mysql_zfs_disks
   availability_zone = data.aws_subnet.lab.availability_zone
   size              = 15
   type              = "gp3"
   encrypted         = true
-
   tags = {
     Project = "mariadb-jenkins-lab"
     Name    = "mariadb-zfs-${each.key}"
@@ -247,12 +200,10 @@ resource "aws_ebs_volume" "mysql_zfs" {
 }
 
 resource "aws_volume_attachment" "mysql_zfs" {
-  for_each = local.mysql_zfs_disks
-
-  device_name = each.value.device
-  volume_id   = aws_ebs_volume.mysql_zfs[each.key].id
-  instance_id = aws_instance.node[each.value.node].id
-
+  for_each     = local.mysql_zfs_disks
+  device_name  = each.value.device
+  volume_id    = aws_ebs_volume.mysql_zfs[each.key].id
+  instance_id  = aws_instance.node[each.value.node].id
   force_detach = false
 }
 
@@ -263,14 +214,12 @@ output "nodes" {
       instance_id = instance.id
       private_ip  = instance.private_ip
       public_ip   = instance.public_ip
-
       zfs_volume_ids = role == "maxscale" ? [] : [
         aws_ebs_volume.mysql_zfs["${role}-a"].id,
         aws_ebs_volume.mysql_zfs["${role}-b"].id
       ]
     }
   }
-
   depends_on = [aws_volume_attachment.mysql_zfs]
 }
 
@@ -280,7 +229,7 @@ output "maxscale_endpoint" {
 
 output "mysql_zfs_volumes" {
   value = {
-    for node in ["primary", "replica1", "replica2"] : node => {
+    for node in keys(local.database_nodes) : node => {
       disk_a = aws_ebs_volume.mysql_zfs["${node}-a"].id
       disk_b = aws_ebs_volume.mysql_zfs["${node}-b"].id
     }
