@@ -1,5 +1,6 @@
 ---
 - name: Configure MariaDB IDs and replication settings
+  tags: [seed_plan]
   hosts: database
   become: true
   serial: 1
@@ -46,6 +47,7 @@
         state: restarted
 
 - name: Create accounts and the demo database on the primary
+  tags: [seed_plan]
   hosts: primary
   become: true
   any_errors_fatal: true
@@ -121,6 +123,7 @@
           )
 
 - name: Configure and start MaxScale before seed donor selection
+  tags: [seed_plan]
   hosts: proxy
   become: true
   any_errors_fatal: true
@@ -159,6 +162,7 @@
         state: restarted
 
 - name: Identify fresh replicas that need a backup seed
+  tags: [seed_plan]
   hosts: replicas
   become: true
   serial: 1
