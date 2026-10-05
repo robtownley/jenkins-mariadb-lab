@@ -1,0 +1,173 @@
+---
+- name: Move InnoDB redo onto its ibd ZFS dataset
+  hosts: database
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Require the redo dataset mount
+      ansible.builtin.command:
+        argv: [findmnt, -rn, -t, zfs, -S, data/mysql/.ibd, -M, /var/lib/mysql/.ibd]
+      changed_when: false
+
+    - name: Read the active redo directory
+      ansible.builtin.command:
+        argv: [mariadb, -N, -B, -e, "SELECT @@innodb_log_group_home_dir"]
+      register: redo_directory
+      changed_when: false
+
+    - name: Require an expected redo directory
+      ansible.builtin.assert:
+        that:
+          - redo_directory.stdout | trim in ['.', './', '/var/lib/mysql', '/var/lib/mysql/', '/var/lib/mysql/.ibd', '/var/lib/mysql/.ibd/']
+
+    - name: Verify replication before migrating a replica
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: replication_before
+      when: inventory_hostname != 'primary'
+
+    - name: Require healthy replica threads
+      ansible.builtin.assert:
+        that:
+          - replication_before.query_result[0] | length == 1
+          - replication_before.query_result[0][0].Slave_IO_Running == 'Yes'
+          - replication_before.query_result[0][0].Slave_SQL_Running == 'Yes'
+      when: inventory_hostname != 'primary'
+
+    - name: Copy the redo log after a full clean shutdown
+      when: redo_directory.stdout | trim not in ['/var/lib/mysql/.ibd', '/var/lib/mysql/.ibd/']
+      block:
+        - name: Refuse an existing destination or missing source
+          ansible.builtin.shell: |
+            set -eu
+            test -f /var/lib/mysql/ib_logfile0
+            test ! -L /var/lib/mysql/ib_logfile0
+            test ! -e /var/lib/mysql/.ibd/ib_logfile0
+          changed_when: false
+
+        - name: Request a full InnoDB shutdown
+          ansible.builtin.command:
+            argv: [mariadb, -e, "SET GLOBAL innodb_fast_shutdown = 0"]
+
+        - name: Stop MariaDB
+          ansible.builtin.systemd_service:
+            name: mariadb
+            state: stopped
+
+        - name: Snapshot and copy the stopped redo log
+          ansible.builtin.shell: |
+            set -eu
+            if pgrep -x mariadbd >/dev/null; then exit 1; fi
+            zfs snapshot -r "data/mysql@before-redo-move-$(date -u +%Y%m%dT%H%M%SZ)"
+            cp -p /var/lib/mysql/ib_logfile0 /var/lib/mysql/.ibd/ib_logfile0
+            cmp /var/lib/mysql/ib_logfile0 /var/lib/mysql/.ibd/ib_logfile0
+            chown mysql:mysql /var/lib/mysql/.ibd /var/lib/mysql/.ibd/ib_logfile0
+
+    - name: Persist the redo location
+      ansible.builtin.copy:
+        dest: /etc/mysql/mariadb.conf.d/98-zfs-redo.cnf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [mariadb]
+          innodb_log_group_home_dir=/var/lib/mysql/.ibd
+      register: redo_config
+
+    - name: Create the systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/mariadb.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Persist a separate redo mount guard
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mariadb.service.d/zfs-redo.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Requires=zfs-mount.service
+          After=zfs-mount.service
+
+          [Service]
+          ExecStartPre=/usr/bin/findmnt -rn -t zfs -S data/mysql/.ibd -M /var/lib/mysql/.ibd
+
+    - name: Start MariaDB with its redo configuration
+      ansible.builtin.systemd_service:
+        name: mariadb
+        daemon_reload: true
+        enabled: true
+        state: "{{ 'restarted' if redo_config.changed else 'started' }}"
+
+    - name: Verify MariaDB has opened the redo file on the dataset
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import os
+        import subprocess
+        from pathlib import Path
+        pid = subprocess.check_output(['systemctl', 'show', 'mariadb', '-p', 'MainPID', '--value'], text=True).strip()
+        expected = '/var/lib/mysql/.ibd/ib_logfile0'
+        for fd in Path('/proc/' + pid + '/fd').iterdir():
+            try:
+                target = os.readlink(fd)
+            except FileNotFoundError:
+                continue
+            if target == expected:
+                print(expected)
+                break
+        else:
+            raise SystemExit('MariaDB has not opened the expected redo file.')
+        PY
+      changed_when: false
+
+    - name: Start replica threads
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: startreplica
+      when: inventory_hostname != 'primary'
+
+    - name: Verify replication recovers
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: replication_after
+      until:
+        - replication_after.query_result[0] | length == 1
+        - replication_after.query_result[0][0].Slave_IO_Running == 'Yes'
+        - replication_after.query_result[0][0].Slave_SQL_Running == 'Yes'
+        - replication_after.query_result[0][0].Seconds_Behind_Master is not none
+        - replication_after.query_result[0][0].Seconds_Behind_Master | int == 0
+      retries: 60
+      delay: 5
+      when: inventory_hostname != 'primary'
+
+    - name: Archive the inactive original redo copy
+      ansible.builtin.shell: |
+        set -eu
+        if [ -f /var/lib/mysql/ib_logfile0 ]; then
+          test ! -L /var/lib/mysql/ib_logfile0
+          python3 - <<'PY'
+        import os
+        import subprocess
+        from pathlib import Path
+        original = Path('/var/lib/mysql/ib_logfile0')
+        for pid in subprocess.check_output(['pgrep', '-x', 'mariadbd'], text=True).split():
+            for fd in Path('/proc/' + pid + '/fd').iterdir():
+                try:
+                    if os.path.samefile(fd, original):
+                        raise SystemExit('Original redo is still open; refusing archival.')
+                except FileNotFoundError:
+                    continue
+        PY
+          archive="/var/lib/mysql-redo-migration-backup/$(date -u +%Y%m%dT%H%M%SZ)"
+          mkdir -p "$archive"
+          chmod 0700 /var/lib/mysql-redo-migration-backup "$archive"
+          mv /var/lib/mysql/ib_logfile0 "$archive/ib_logfile0"
+          echo REDO_ARCHIVED
+        fi
+      register: redo_archive
+      changed_when: "'REDO_ARCHIVED' in redo_archive.stdout"
