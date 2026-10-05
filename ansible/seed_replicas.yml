@@ -1,0 +1,411 @@
+---
+- name: Select a replica-first seed source
+  hosts: primary
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Choose and snapshot a donor only when new replicas exist
+      when: groups.get('seed_targets', []) | length > 0
+      block:
+        - name: Read primary version
+          ansible.builtin.command:
+            argv: [mariadb, -N, -B, -e, 'SELECT VERSION()']
+          register: primary_seed_version
+          changed_when: false
+
+        - name: Probe existing replicas for seed eligibility
+          ansible.builtin.script:
+            cmd: '../scripts/create_zfs_seed.py probe'
+            executable: /usr/bin/python3
+          delegate_to: '{{ item }}'
+          loop: "{{ groups['replicas'] | difference(groups.get('seed_targets', [])) | sort }}"
+          register: donor_probes
+          changed_when: false
+          failed_when: false
+          ignore_unreachable: true
+
+        - name: Initialize candidate list
+          ansible.builtin.set_fact:
+            seed_candidates: []
+
+        - name: Collect healthy compatible replica donors
+          ansible.builtin.set_fact:
+            seed_candidates: '{{ seed_candidates + [item.item] }}'
+          loop: '{{ donor_probes.results | default([]) }}'
+          when:
+            - not (item.unreachable | default(false))
+            - item.rc | default(1) == 0
+            - (item.stdout | default('{}') | from_json).eligible | default(false)
+            - (item.stdout | from_json).primary == hostvars['primary'].ansible_host
+            - (item.stdout | from_json).version.split('-')[0] == primary_seed_version.stdout.split('-')[0]
+          loop_control:
+            label: '{{ item.item }}'
+
+        - name: Inspect candidate availability in MaxScale
+          ansible.builtin.command:
+            argv: [maxctrl, api, get, 'servers/{{ item }}']
+          delegate_to: maxscale
+          loop: '{{ seed_candidates }}'
+          register: proxy_candidates
+          changed_when: false
+          failed_when: false
+
+        - name: Reset the available donor list
+          ansible.builtin.set_fact:
+            available_donors: []
+
+        - name: Keep only running replicas not already administratively isolated
+          ansible.builtin.set_fact:
+            available_donors: '{{ available_donors + [item.item] }}'
+          loop: '{{ proxy_candidates.results | default([]) }}'
+          when:
+            - item.rc | default(1) == 0
+            - "'running' in ((item.stdout | from_json).data.attributes.state | lower)"
+            - "'slave' in ((item.stdout | from_json).data.attributes.state | lower)"
+            - "'maintenance' not in ((item.stdout | from_json).data.attributes.state | lower)"
+            - "'drain' not in ((item.stdout | from_json).data.attributes.state | lower)"
+          loop_control:
+            label: '{{ item.item }}'
+
+        - name: Use only available candidates
+          ansible.builtin.set_fact:
+            seed_candidates: '{{ available_donors }}'
+
+        - name: Require permission before falling back to the primary
+          ansible.builtin.assert:
+            that:
+              - seed_candidates | length > 0 or lookup('env', 'ALLOW_PRIMARY_SEED') | default('false', true) | bool
+            fail_msg: 'No healthy ZFS replica donor. Review the reason, then rerun with ALLOW_PRIMARY_SEED enabled to permit a primary copy.'
+
+        - name: Record the selected donor
+          ansible.builtin.set_fact:
+            seed_source: "{{ seed_candidates[0] if seed_candidates | length > 0 else 'primary' }}"
+            seed_method: "{{ 'zfs' if seed_candidates | length > 0 else 'cold' }}"
+
+        - name: Probe primary ZFS layout when fallback is permitted
+          ansible.builtin.script:
+            cmd: '../scripts/create_zfs_seed.py probe --primary'
+            executable: /usr/bin/python3
+          register: primary_probe
+          changed_when: false
+          when: seed_source == 'primary'
+
+        - name: Use a primary ZFS snapshot if its layout is ready
+          ansible.builtin.set_fact:
+            seed_method: "{{ 'zfs' if (primary_probe.stdout | from_json).eligible else 'cold' }}"
+          when: seed_source == 'primary'
+
+        - name: Log every seed pairing
+          ansible.builtin.debug:
+            msg: '{{ item }} seeding from > {{ seed_source }} ({{ seed_method }})'
+          loop: "{{ groups['seed_targets'] }}"
+
+        - name: Require the donor transfer dataset mount
+          ansible.builtin.command:
+            argv: [findmnt, -rn, -t, zfs, -S, data/backup_source, -M, /data/backup_source]
+          delegate_to: '{{ seed_source }}'
+          changed_when: false
+
+        - name: Check source capacity
+          ansible.builtin.shell: |
+            set -eu
+            required=$(du -sb /var/lib/mysql | awk '{print $1}')
+            available=$(zfs get -Hp -o value available data/backup_source)
+            test "$available" -gt "$((required * 3 + 1073741824))"
+          delegate_to: '{{ seed_source }}'
+          changed_when: false
+
+        - name: Clear the previous donor transfer workspace
+          ansible.builtin.file:
+            path: /data/backup_source/.jenkins-seed-current
+            state: absent
+          delegate_to: '{{ seed_source }}'
+
+        - name: Prepare a replica ZFS stream with traffic isolation
+          when: seed_method == 'zfs' and seed_source != 'primary'
+          block:
+            - name: Inspect donor state in MaxScale
+              ansible.builtin.command:
+                argv: [maxctrl, api, get, 'servers/{{ seed_source }}']
+              delegate_to: maxscale
+              register: maxscale_donor
+              changed_when: false
+
+            - name: Require a donor that is not already in maintenance or drain
+              ansible.builtin.assert:
+                that:
+                  - "'maintenance' not in ((maxscale_donor.stdout | from_json).data.attributes.state | lower)"
+                  - "'drain' not in ((maxscale_donor.stdout | from_json).data.attributes.state | lower)"
+                fail_msg: 'Donor is already administratively isolated; refusing to change its state.'
+
+            - name: Drain existing donor connections
+              ansible.builtin.command:
+                argv: [maxctrl, set, server, '{{ seed_source }}', drain]
+              delegate_to: maxscale
+              register: donor_drained
+
+            - name: Wait for donor connections to drain
+              ansible.builtin.command:
+                argv: [maxctrl, api, get, 'servers/{{ seed_source }}']
+              delegate_to: maxscale
+              register: drain_status
+              changed_when: false
+              until: (drain_status.stdout | from_json).data.attributes.statistics.connections | int == 0
+              retries: 60
+              delay: 2
+
+            - name: Put the drained donor into maintenance
+              ansible.builtin.command:
+                argv: [maxctrl, set, server, '{{ seed_source }}', maintenance]
+              delegate_to: maxscale
+              register: donor_maintenance
+
+            - name: Snapshot stopped MariaDB then restart the donor
+              ansible.builtin.script:
+                cmd: '../scripts/create_zfs_seed.py snapshot'
+                executable: /usr/bin/python3
+              delegate_to: '{{ seed_source }}'
+              register: zfs_seed
+
+            - name: Capture the snapshot manifest
+              ansible.builtin.set_fact:
+                seed_manifest: '{{ zfs_seed.stdout | from_json }}'
+          always:
+            - name: Verify donor recovery before allowing traffic again
+              community.mysql.mysql_query:
+                login_unix_socket: /run/mysqld/mysqld.sock
+                query: SHOW SLAVE STATUS
+              delegate_to: '{{ seed_source }}'
+              register: recovered_donor
+              until:
+                - recovered_donor.query_result[0] | length == 1
+                - recovered_donor.query_result[0][0].Slave_IO_Running == 'Yes'
+                - recovered_donor.query_result[0][0].Slave_SQL_Running == 'Yes'
+                - recovered_donor.query_result[0][0].Seconds_Behind_Master is not none
+                - recovered_donor.query_result[0][0].Seconds_Behind_Master | int == 0
+              retries: 60
+              delay: 2
+              when: donor_drained is defined and donor_drained is succeeded
+
+            - name: Clear only maintenance set by this run
+              ansible.builtin.command:
+                argv: [maxctrl, clear, server, '{{ seed_source }}', maintenance]
+              delegate_to: maxscale
+              when: donor_maintenance is defined and donor_maintenance is succeeded and recovered_donor is defined and recovered_donor is succeeded
+
+            - name: Clear only drain set by this run
+              ansible.builtin.command:
+                argv: [maxctrl, clear, server, '{{ seed_source }}', drain]
+              delegate_to: maxscale
+              when: donor_drained is defined and donor_drained is succeeded and recovered_donor is defined and recovered_donor is succeeded
+
+        - name: Snapshot the primary only with explicit fallback permission
+          ansible.builtin.script:
+            cmd: '../scripts/create_zfs_seed.py snapshot --primary'
+            executable: /usr/bin/python3
+          register: primary_zfs_seed
+          when: seed_method == 'zfs' and seed_source == 'primary'
+
+        - name: Record primary ZFS snapshot coordinates
+          ansible.builtin.set_fact:
+            seed_manifest: '{{ primary_zfs_seed.stdout | from_json }}'
+          when: seed_method == 'zfs' and seed_source == 'primary'
+
+        - name: Use an explicitly permitted primary cold seed
+          when: seed_method == 'cold'
+          block:
+            - name: Explain primary downtime
+              ansible.builtin.debug:
+                msg: 'PRIMARY FALLBACK: primary writes pause during the clean copy; no eligible replica donor exists.'
+
+            - name: Ensure rsync exists on the primary
+              ansible.builtin.apt:
+                name: rsync
+                state: present
+
+            - name: Create the primary copy workspace
+              ansible.builtin.file:
+                path: /data/backup_source/.jenkins-seed-current
+                state: directory
+                mode: '0700'
+
+            - name: Make a consistent cold copy and restart primary
+              ansible.builtin.script:
+                cmd: ../scripts/create_cold_seed.py
+                executable: /usr/bin/python3
+              register: cold_seed
+
+            - name: Record primary seed coordinates
+              ansible.builtin.set_fact:
+                seed_manifest:
+                  gtid: '{{ (cold_seed.stdout | from_json).gtid }}'
+                  version: '{{ primary_seed_version.stdout }}'
+                  method: cold
+                  redo_subdir: ''
+
+            - name: Package the cold copy
+              ansible.builtin.command:
+                argv: [tar, -czf, /data/backup_source/.jenkins-seed-current/seed.tar.gz, -C, /data/backup_source/.jenkins-seed-current, backup]
+
+        - name: Generate the ZFS stream after donor recovery and traffic restoration
+          ansible.builtin.script:
+            cmd: '../scripts/create_zfs_seed.py send'
+            executable: /usr/bin/python3
+          delegate_to: '{{ seed_source }}'
+          when: seed_method == 'zfs'
+
+        - name: Create a private Jenkins transfer directory
+          ansible.builtin.file:
+            path: '{{ playbook_dir }}/../.seed-transfer'
+            state: directory
+            mode: '0700'
+          delegate_to: localhost
+          become: false
+
+        - name: Fetch the seed once for all destinations
+          ansible.builtin.fetch:
+            src: "/data/backup_source/.jenkins-seed-current/{{ 'seed.zfs' if seed_method == 'zfs' else 'seed.tar.gz' }}"
+            dest: "{{ playbook_dir }}/../.seed-transfer/{{ 'seed.zfs' if seed_method == 'zfs' else 'seed.tar.gz' }}"
+            flat: true
+          delegate_to: '{{ seed_source }}'
+          no_log: true
+
+- name: Restore only fresh replicas from the selected donor
+  hosts: seed_targets
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    manifest: "{{ hostvars['primary'].seed_manifest }}"
+    seed_source: "{{ hostvars['primary'].seed_source }}"
+  tasks:
+    - name: Log the destination and its seeder
+      ansible.builtin.debug:
+        msg: '{{ inventory_hostname }} seeding from > {{ seed_source }}; GTID={{ manifest.gtid }}'
+
+    - name: Refuse mounted or previously restored datadirs
+      ansible.builtin.shell: |
+        set -eu
+        test ! -e /var/lib/mysql-before-seed
+        if mountpoint -q /var/lib/mysql; then exit 1; fi
+        if zfs list -H data/jenkins-seed-receive >/dev/null 2>&1; then
+          echo 'Previous receive dataset exists: inspect the interrupted restore.'
+          exit 1
+        fi
+      changed_when: false
+
+    - name: Require matching MariaDB version
+      ansible.builtin.command:
+        argv: [mariadb, -N, -B, -e, 'SELECT VERSION()']
+      register: destination_version
+      changed_when: false
+
+    - name: Validate version and GTID manifest
+      ansible.builtin.assert:
+        that:
+          - destination_version.stdout.split('-')[0] == manifest.version.split('-')[0]
+          - manifest.gtid is match('^[0-9]+-[0-9]+-[0-9]+(,[0-9]+-[0-9]+-[0-9]+)*$')
+
+    - name: Install rsync
+      ansible.builtin.apt:
+        name: rsync
+        state: present
+
+    - name: Create private receive workspace
+      ansible.builtin.file:
+        path: /var/tmp/.jenkins-seed-current
+        state: directory
+        mode: '0700'
+
+    - name: Inspect stream size in the Jenkins workspace
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../.seed-transfer/{{ 'seed.zfs' if manifest.method == 'zfs' else 'seed.tar.gz' }}"
+      delegate_to: localhost
+      become: false
+      register: seed_file
+
+    - name: Check space for transfer and receive before copying
+      ansible.builtin.shell: |
+        set -eu
+        root_free=$(df -B1 --output=avail /var/tmp | tail -n 1)
+        pool_free=$(zfs get -Hp -o value available data)
+        test "$root_free" -gt "$(({{ seed_file.stat.size }} * 3 + 1073741824))"
+        test "$pool_free" -gt "$(({{ seed_file.stat.size }} * 2 + 1073741824))"
+      changed_when: false
+
+    - name: Transfer seed to this destination
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../.seed-transfer/{{ 'seed.zfs' if manifest.method == 'zfs' else 'seed.tar.gz' }}"
+        dest: "/var/tmp/.jenkins-seed-current/{{ 'seed.zfs' if manifest.method == 'zfs' else 'seed.tar.gz' }}"
+        mode: '0600'
+      no_log: true
+
+    - name: Receive recursive stream without source mountpoints
+      when: manifest.method == 'zfs'
+      ansible.builtin.shell: |
+        set -eu
+        zfs receive -u -o readonly=on -x mountpoint -x canmount data/jenkins-seed-receive \
+          < /var/tmp/.jenkins-seed-current/seed.zfs
+        zfs set mountpoint=/var/tmp/.jenkins-seed-current/backup data/jenkins-seed-receive
+        zfs set canmount=on data/jenkins-seed-receive
+        zfs mount data/jenkins-seed-receive
+        for child in .ibd .log .tmp; do
+          zfs set canmount=on "data/jenkins-seed-receive/$child"
+          zfs mount "data/jenkins-seed-receive/$child"
+        done
+
+    - name: Extract a primary cold copy
+      when: manifest.method == 'cold'
+      ansible.builtin.unarchive:
+        src: /var/tmp/.jenkins-seed-current/seed.tar.gz
+        dest: /var/tmp/.jenkins-seed-current
+        remote_src: true
+
+    - name: Verify disk headroom before touching original data
+      ansible.builtin.shell: |
+        set -eu
+        required=$(du -sb /var/tmp/.jenkins-seed-current/backup | awk '{print $1}')
+        available=$(df -B1 --output=avail /var/lib/mysql | tail -n 1)
+        test "$available" -gt "$((required + 1073741824))"
+      changed_when: false
+
+    - name: Stop the fresh destination
+      ansible.builtin.systemd_service:
+        name: mariadb
+        state: stopped
+
+    - name: Preserve initial files and copy the clean seed without donor channel or logs
+      ansible.builtin.shell: |
+        set -eu
+        test ! -e /var/lib/mysql-before-seed
+        if pgrep -x mariadbd >/dev/null; then exit 1; fi
+        mv /var/lib/mysql /var/lib/mysql-before-seed
+        mkdir /var/lib/mysql
+        rsync -aH --numeric-ids \
+          --exclude='/.log/' --exclude='/.tmp/' --exclude='/ibtmp1' \
+          --exclude='/ib_logfile0' --exclude='/.ibd/ib_logfile0' \
+          --exclude='/master.info*' --exclude='/relay-log.info*' \
+          --exclude='/multi-master.info' --exclude='/mariadb-bin.*' \
+          --exclude='/mariadb-relay.*' --exclude='/seed-gtid.txt' \
+          /var/tmp/.jenkins-seed-current/backup/ /var/lib/mysql/
+        cp -p "/var/tmp/.jenkins-seed-current/backup/{{ manifest.redo_subdir ~ '/' if manifest.redo_subdir else '' }}ib_logfile0" /var/lib/mysql/ib_logfile0
+        mkdir -p /var/lib/mysql/.log /var/lib/mysql/.tmp
+        chown -R mysql:mysql /var/lib/mysql
+      changed_when: true
+
+    - name: Start with the destination's own server configuration
+      ansible.builtin.systemd_service:
+        name: mariadb
+        state: started
+
+    - name: Set the applied seed position without local binlog events
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - SET SESSION sql_log_bin = 0
+          - "SET GLOBAL gtid_slave_pos = '{{ manifest.gtid }}'"
+
+    - name: Destroy only the temporary receive dataset after successful restoration
+      when: manifest.method == 'zfs'
+      ansible.builtin.command:
+        argv: [zfs, destroy, -r, data/jenkins-seed-receive]
