@@ -120,6 +120,44 @@
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           )
 
+- name: Configure and start MaxScale before seed donor selection
+  hosts: proxy
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    - name: Write the dynamic MaxScale configuration
+      ansible.builtin.template:
+        src: templates/maxscale.cnf.j2
+        dest: /etc/maxscale.cnf
+        owner: root
+        group: maxscale
+        mode: "0640"
+      notify: Restart MaxScale
+      no_log: true
+
+    - name: Apply configuration changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start MaxScale
+      ansible.builtin.systemd_service:
+        name: maxscale
+        enabled: true
+        state: started
+
+    - name: Wait for the database listener
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 3306
+        timeout: 60
+
+  handlers:
+    - name: Restart MaxScale
+      ansible.builtin.systemd_service:
+        name: maxscale
+        state: restarted
+
 - name: Identify fresh replicas that need a backup seed
   hosts: replicas
   become: true
@@ -221,38 +259,13 @@
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }}: IO=Yes, SQL=Yes, lag=0"
 
-- name: Configure MaxScale and test a write through the proxy
+- name: Test a write through the configured proxy
   hosts: proxy
   become: true
   any_errors_fatal: true
   vars_files:
     - secrets.yml
   tasks:
-    - name: Write the dynamic MaxScale configuration
-      ansible.builtin.template:
-        src: templates/maxscale.cnf.j2
-        dest: /etc/maxscale.cnf
-        owner: root
-        group: maxscale
-        mode: "0640"
-      notify: Restart MaxScale
-      no_log: true
-
-    - name: Apply configuration changes
-      ansible.builtin.meta: flush_handlers
-
-    - name: Enable and start MaxScale
-      ansible.builtin.systemd_service:
-        name: maxscale
-        enabled: true
-        state: started
-
-    - name: Wait for the database listener
-      ansible.builtin.wait_for:
-        host: 127.0.0.1
-        port: 3306
-        timeout: 60
-
     - name: Insert this build's marker through MaxScale
       community.mysql.mysql_query:
         login_host: 127.0.0.1
@@ -275,12 +288,6 @@
     - name: Report successful proxy write
       ansible.builtin.debug:
         msg: "Write through MaxScale succeeded: {{ lab_test_marker }}"
-
-  handlers:
-    - name: Restart MaxScale
-      ansible.builtin.systemd_service:
-        name: maxscale
-        state: restarted
 
 - name: Verify the proxy write reached every database node
   hosts: database
