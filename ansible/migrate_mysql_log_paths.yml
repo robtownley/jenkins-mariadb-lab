@@ -1,0 +1,205 @@
+---
+- name: Put MariaDB logs and temporary files on their ZFS datasets
+  hosts: database
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    zfs_paths_config: |
+      [mariadb]
+      log_bin=/var/lib/mysql/.log/mariadb-bin
+      log_bin_index=/var/lib/mysql/.log/mariadb-bin.index
+      relay_log=/var/lib/mysql/.log/mariadb-relay
+      relay_log_index=/var/lib/mysql/.log/mariadb-relay.index
+      tmpdir=/var/lib/mysql/.tmp
+      innodb_tmpdir=/var/lib/mysql/.tmp
+      innodb_temp_data_file_path=.tmp/ibtmp1:12M:autoextend
+
+  tasks:
+    - name: Check pool health
+      ansible.builtin.command: zpool list -H -o health data
+      register: pool_health
+      changed_when: false
+      failed_when: pool_health.stdout | trim != 'ONLINE'
+
+    - name: Require the expected ZFS mounts
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -rn
+          - -t
+          - zfs
+          - -S
+          - "{{ item.dataset }}"
+          - -M
+          - "{{ item.path }}"
+      loop:
+        - dataset: data/mysql
+          path: /var/lib/mysql
+        - dataset: data/mysql/.log
+          path: /var/lib/mysql/.log
+        - dataset: data/mysql/.tmp
+          path: /var/lib/mysql/.tmp
+      changed_when: false
+
+    - name: Read current log location
+      ansible.builtin.command:
+        argv:
+          - mariadb
+          - -N
+          - -B
+          - -e
+          - "SELECT @@log_bin_basename"
+      register: current_binlog
+      changed_when: false
+
+    - name: Require an expected log location
+      ansible.builtin.assert:
+        that:
+          - current_binlog.stdout | trim in
+            ['/var/lib/mysql/mariadb-bin',
+             '/var/lib/mysql/.log/mariadb-bin']
+        fail_msg: "Unexpected binlog location; refusing migration."
+
+    - name: Check replication before changing a replica
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: replica_before
+      when: inventory_hostname != 'primary'
+
+    - name: Require healthy replication
+      ansible.builtin.assert:
+        that:
+          - replica_before.query_result[0] | length == 1
+          - replica_before.query_result[0][0].Slave_IO_Running == 'Yes'
+          - replica_before.query_result[0][0].Slave_SQL_Running == 'Yes'
+        fail_msg: "Replication is unhealthy; stopping here."
+      when: inventory_hostname != 'primary'
+
+    - name: Migrate existing logs
+      when: current_binlog.stdout | trim == '/var/lib/mysql/mariadb-bin'
+      block:
+        - name: Stop MariaDB before copying logs
+          ansible.builtin.systemd_service:
+            name: mariadb
+            state: stopped
+
+        - name: Require MariaDB processes to have stopped
+          ansible.builtin.command: pgrep -x mariadbd
+          register: remaining_process
+          changed_when: false
+          failed_when: remaining_process.rc != 1
+
+        - name: Snapshot the stopped database and child datasets
+          ansible.builtin.shell: |
+            set -eu
+            snapshot="data/mysql@before-log-move-$(date -u +%Y%m%dT%H%M%SZ)"
+            zfs snapshot -r "$snapshot"
+            echo "$snapshot"
+          register: migration_snapshot
+          changed_when: true
+
+        - name: Report recovery snapshot
+          ansible.builtin.debug:
+            var: migration_snapshot.stdout
+
+        - name: Copy logs and fix indexes and relay metadata
+          ansible.builtin.script:
+            cmd: ../scripts/move_mysql_logs.py
+            executable: /usr/bin/python3
+
+    - name: Set dataset root ownership
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: mysql
+        group: mysql
+      loop:
+        - /var/lib/mysql/.log
+        - /var/lib/mysql/.tmp
+
+    - name: Persist log and temporary file locations
+      ansible.builtin.copy:
+        dest: /etc/mysql/mariadb.conf.d/99-zfs-paths.cnf
+        owner: root
+        group: root
+        mode: "0644"
+        content: "{{ zfs_paths_config }}"
+      register: paths_config
+
+    - name: Create systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/mariadb.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Require all MariaDB ZFS mounts at startup
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mariadb.service.d/zfs.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Requires=zfs-mount.service
+          After=zfs-mount.service
+
+          [Service]
+          ExecStartPre=/usr/bin/findmnt -rn -t zfs -S data/mysql -M /var/lib/mysql
+          ExecStartPre=/usr/bin/findmnt -rn -t zfs -S data/mysql/.log -M /var/lib/mysql/.log
+          ExecStartPre=/usr/bin/findmnt -rn -t zfs -S data/mysql/.tmp -M /var/lib/mysql/.tmp
+
+    - name: Start MariaDB or apply a changed configuration
+      ansible.builtin.systemd_service:
+        name: mariadb
+        daemon_reload: true
+        enabled: true
+        state: "{{ 'restarted' if paths_config.changed else 'started' }}"
+
+    - name: Verify all configured paths
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: |
+          SELECT
+            @@log_bin_basename AS binlog,
+            @@log_bin_index AS binlog_index,
+            @@relay_log_basename AS relaylog,
+            @@relay_log_index AS relaylog_index,
+            @@tmpdir AS tmpdir,
+            @@innodb_tmpdir AS innodb_tmpdir,
+            @@innodb_temp_data_file_path AS temp_tablespace
+      register: verified_paths
+
+    - name: Require the intended paths
+      ansible.builtin.assert:
+        that:
+          - verified_paths.query_result[0][0].binlog == '/var/lib/mysql/.log/mariadb-bin'
+          - verified_paths.query_result[0][0].binlog_index == '/var/lib/mysql/.log/mariadb-bin.index'
+          - verified_paths.query_result[0][0].relaylog == '/var/lib/mysql/.log/mariadb-relay'
+          - verified_paths.query_result[0][0].relaylog_index == '/var/lib/mysql/.log/mariadb-relay.index'
+          - verified_paths.query_result[0][0].tmpdir == '/var/lib/mysql/.tmp'
+          - verified_paths.query_result[0][0].innodb_tmpdir == '/var/lib/mysql/.tmp'
+          - verified_paths.query_result[0][0].temp_tablespace == '.tmp/ibtmp1:12M:autoextend'
+
+    - name: Start replica threads
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: startreplica
+      when: inventory_hostname != 'primary'
+
+    - name: Wait for replication to catch up
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: replica_after
+      until:
+        - replica_after.query_result[0] | length == 1
+        - replica_after.query_result[0][0].Slave_IO_Running == 'Yes'
+        - replica_after.query_result[0][0].Slave_SQL_Running == 'Yes'
+        - replica_after.query_result[0][0].Seconds_Behind_Master is not none
+        - replica_after.query_result[0][0].Seconds_Behind_Master | int == 0
+      retries: 30
+      delay: 5
+      when: inventory_hostname != 'primary'
