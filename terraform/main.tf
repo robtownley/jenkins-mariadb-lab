@@ -9,6 +9,33 @@ locals {
     replica2 = "mariadb-replica-2"
     maxscale = "mariadb-maxscale"
   }
+
+  mysql_zfs_disks = {
+    primary-a = {
+      node   = "primary"
+      device = "/dev/sdf"
+    }
+    primary-b = {
+      node   = "primary"
+      device = "/dev/sdg"
+    }
+    replica1-a = {
+      node   = "replica1"
+      device = "/dev/sdf"
+    }
+    replica1-b = {
+      node   = "replica1"
+      device = "/dev/sdg"
+    }
+    replica2-a = {
+      node   = "replica2"
+      device = "/dev/sdf"
+    }
+    replica2-b = {
+      node   = "replica2"
+      device = "/dev/sdg"
+    }
+  }
 }
 
 data "aws_subnet" "lab" {
@@ -203,6 +230,31 @@ resource "aws_instance" "node" {
   }
 }
 
+resource "aws_ebs_volume" "mysql_zfs" {
+  for_each = local.mysql_zfs_disks
+
+  availability_zone = data.aws_subnet.lab.availability_zone
+  size              = 15
+  type              = "gp3"
+  encrypted         = true
+
+  tags = {
+    Project = "mariadb-jenkins-lab"
+    Name    = "mariadb-zfs-${each.key}"
+    Purpose = "mysql-zfs-mirror"
+  }
+}
+
+resource "aws_volume_attachment" "mysql_zfs" {
+  for_each = local.mysql_zfs_disks
+
+  device_name = each.value.device
+  volume_id   = aws_ebs_volume.mysql_zfs[each.key].id
+  instance_id = aws_instance.node[each.value.node].id
+
+  force_detach = false
+}
+
 output "nodes" {
   value = {
     for role, instance in aws_instance.node : role => {
@@ -210,10 +262,26 @@ output "nodes" {
       instance_id = instance.id
       private_ip  = instance.private_ip
       public_ip   = instance.public_ip
+
+      zfs_volume_ids = role == "maxscale" ? [] : [
+        aws_ebs_volume.mysql_zfs["${role}-a"].id,
+        aws_ebs_volume.mysql_zfs["${role}-b"].id
+      ]
     }
   }
+
+  depends_on = [aws_volume_attachment.mysql_zfs]
 }
 
 output "maxscale_endpoint" {
   value = "${aws_instance.node["maxscale"].private_ip}:3306"
+}
+
+output "mysql_zfs_volumes" {
+  value = {
+    for node in ["primary", "replica1", "replica2"] : node => {
+      disk_a = aws_ebs_volume.mysql_zfs["${node}-a"].id
+      disk_b = aws_ebs_volume.mysql_zfs["${node}-b"].id
+    }
+  }
 }
