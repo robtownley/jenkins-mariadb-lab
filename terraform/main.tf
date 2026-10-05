@@ -1,13 +1,13 @@
 locals {
-  vpc_id             = "vpc-0e108fe4a8ffe3dee"
-  subnet_id          = "subnet-0bb1a97785b8ba5a5"
-  jenkins_sg_id      = "sg-0243f521e59c4d971"
+  vpc_id        = "vpc-0e108fe4a8ffe3dee"
+  subnet_id     = "subnet-0bb1a97785b8ba5a5"
+  jenkins_sg_id = "sg-0243f521e59c4d971"
 
   nodes = {
-    primary   = "mariadb-primary"
-    replica1  = "mariadb-replica-1"
-    replica2  = "mariadb-replica-2"
-    maxscale  = "mariadb-maxscale"
+    primary  = "mariadb-primary"
+    replica1 = "mariadb-replica-1"
+    replica2 = "mariadb-replica-2"
+    maxscale = "mariadb-maxscale"
   }
 }
 
@@ -123,6 +123,31 @@ resource "aws_security_group" "database" {
   }
 }
 
+resource "aws_security_group" "lab_ssh" {
+  name        = "jenkins-mariadb-lab-internal-ssh"
+  description = "SSH between lab nodes"
+  vpc_id      = local.vpc_id
+
+  ingress {
+    description = "SSH from other lab nodes"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    self        = true
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "jenkins-mariadb-lab-internal-ssh"
+  }
+}
+
 resource "aws_instance" "node" {
   for_each = local.nodes
 
@@ -135,7 +160,8 @@ resource "aws_instance" "node" {
   vpc_security_group_ids = [
     each.key == "maxscale"
     ? aws_security_group.maxscale.id
-    : aws_security_group.database.id
+    : aws_security_group.database.id,
+    aws_security_group.lab_ssh.id
   ]
 
   root_block_device {
