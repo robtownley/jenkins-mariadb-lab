@@ -192,10 +192,15 @@ resource "aws_instance" "node" {
   ]
 
   root_block_device {
-    volume_size           = 20
-    volume_type           = "gp3"
-    encrypted             = true
-    delete_on_termination = true
+     volume_size           = 20
+     volume_type           = "gp3"
+     encrypted             = true
+     delete_on_termination = true
+
+     tags = {
+       Project = "mariadb-jenkins-lab"
+       Name    = "${each.value}-root"
+     }
   }
 
   metadata_options {
@@ -212,10 +217,6 @@ resource "aws_instance" "node" {
     Role = each.key
   }
 
-  volume_tags = {
-    Project = "mariadb-jenkins-lab"
-    Name    = "${each.value}-root"
-  }
 
   lifecycle {
     ignore_changes = [ami]
