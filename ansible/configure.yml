@@ -94,3 +94,451 @@
           "*.*": "SHOW DATABASES"
         state: present
       no_log: true
+
+    - name: Create the demo database
+      community.mysql.mysql_db:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        name: lab
+        state: present
+
+    - name: Create the demo application account
+      community.mysql.mysql_user:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        name: lab_app
+        host: "%"
+        password: "{{ lab_app_password }}"
+        priv: "lab.*:SELECT,INSERT,UPDATE,DELETE"
+        state: present
+      no_log: true
+
+    - name: Create a table for pipeline verification
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: |
+          CREATE TABLE IF NOT EXISTS lab.pipeline_checks (
+            marker VARCHAR(200) PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )
+
+- name: Identify fresh replicas that need a backup seed
+  hosts: replicas
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Inspect existing replication configuration
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: existing_replication
+
+    - name: Reject unexpected replication channels
+      ansible.builtin.assert:
+        that:
+          - existing_replication.query_result[0] | length <= 1
+        fail_msg: "Multi-source channels are outside this lab's seed procedure."
+
+    - name: Confirm an existing channel points to our primary
+      ansible.builtin.assert:
+        that:
+          - existing_replication.query_result[0][0].Master_Host == hostvars['primary'].ansible_host
+        fail_msg: "Replica points elsewhere; refusing automatic reconfiguration."
+      when: existing_replication.query_result[0] | length > 0
+
+    - name: Inspect application schemas on a fresh replica
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: |
+          SELECT COUNT(*) AS database_count
+          FROM information_schema.SCHEMATA
+          WHERE SCHEMA_NAME NOT IN (
+            'mysql', 'information_schema', 'performance_schema', 'sys'
+          )
+      register: existing_databases
+      when: existing_replication.query_result[0] | length == 0
+
+    - name: Only seed fresh replicas without application data
+      ansible.builtin.assert:
+        that:
+          - existing_databases.query_result[0][0].database_count | int == 0
+        fail_msg: "Unconfigured replica contains application data. Inspect it before reseeding."
+      when: existing_replication.query_result[0] | length == 0
+
+    - name: Add fresh replica to this run's seed targets
+      ansible.builtin.add_host:
+        name: "{{ inventory_hostname }}"
+        groups: seed_targets
+      when: existing_replication.query_result[0] | length == 0
+
+- name: Take and prepare one primary backup for this run's new replicas
+  hosts: primary
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Prepare primary seed archive
+      when: groups.get('seed_targets', []) | length > 0
+      block:
+        - name: Install the matching backup utility
+          ansible.builtin.apt:
+            name: mariadb-backup
+            state: present
+
+        - name: Read server version
+          ansible.builtin.command:
+            argv: [mariadb, -N, -B, -e, "SELECT VERSION()"]
+          register: seed_server_version
+          changed_when: false
+
+        - name: Read backup utility version
+          ansible.builtin.command: mariadb-backup --version
+          register: seed_backup_version
+          changed_when: false
+
+        - name: Require matching server and backup versions
+          ansible.builtin.assert:
+            that:
+              - seed_server_version.stdout.split('-')[0] in (seed_backup_version.stdout + seed_backup_version.stderr)
+            fail_msg: "Install mariadb-backup matching the running server version."
+
+        - name: Require the backup source dataset
+          ansible.builtin.command:
+            argv: [findmnt, -rn, -t, zfs, -S, data/backup_source, -M, /data/backup_source]
+          changed_when: false
+
+        - name: Check source backup headroom
+          ansible.builtin.shell: |
+            set -eu
+            required=$(du -sb /var/lib/mysql | awk '{print $1}')
+            available=$(zfs get -Hp -o value available data/backup_source)
+            test "$available" -gt "$((required * 3 + 1073741824))"
+          changed_when: false
+
+        - name: Remove the previous transient seed workspace
+          ansible.builtin.file:
+            path: /data/backup_source/.jenkins-seed-current
+            state: absent
+
+        - name: Create a private seed workspace
+          ansible.builtin.file:
+            path: /data/backup_source/.jenkins-seed-current
+            state: directory
+            mode: "0700"
+
+        - name: Back up the primary with consistent replication coordinates
+          ansible.builtin.command:
+            argv:
+              - mariadb-backup
+              - --backup
+              - --user=root
+              - --socket=/run/mysqld/mysqld.sock
+              - --target-dir=/data/backup_source/.jenkins-seed-current/backup
+
+        - name: Prepare the physical backup
+          ansible.builtin.command:
+            argv:
+              - mariadb-backup
+              - --prepare
+              - --target-dir=/data/backup_source/.jenkins-seed-current/backup
+
+        - name: Read the backup GTID coordinates
+          ansible.builtin.shell: |
+            python3 - <<'PY'
+            import re
+            from pathlib import Path
+            directory = Path('/data/backup_source/.jenkins-seed-current/backup')
+            for name in ('xtrabackup_binlog_info', 'mariadb_backup_binlog_info'):
+                path = directory / name
+                if path.is_file():
+                    fields = path.read_text().split()
+                    if len(fields) >= 3 and re.fullmatch(r'[0-9]+-[0-9]+-[0-9]+(?:,[0-9]+-[0-9]+-[0-9]+)*', fields[2]):
+                        print(fields[2])
+                        break
+            else:
+                raise SystemExit('Backup has no valid GTID coordinates.')
+            PY
+          register: seed_coordinates
+          changed_when: false
+
+        - name: Retain backup GTID position for the restore plays
+          ansible.builtin.set_fact:
+            lab_seed_gtid: "{{ seed_coordinates.stdout | trim }}"
+
+        - name: Package the prepared backup
+          ansible.builtin.command:
+            argv:
+              - tar
+              - -czf
+              - /data/backup_source/.jenkins-seed-current/seed.tar.gz
+              - -C
+              - /data/backup_source/.jenkins-seed-current
+              - backup
+
+        - name: Restrict archive permissions
+          ansible.builtin.file:
+            path: /data/backup_source/.jenkins-seed-current/seed.tar.gz
+            mode: "0600"
+
+        - name: Create a private Jenkins transfer directory
+          ansible.builtin.file:
+            path: "{{ playbook_dir }}/../.seed-transfer"
+            state: directory
+            mode: "0700"
+          delegate_to: localhost
+          become: false
+
+        - name: Fetch the seed archive into the private Jenkins workspace
+          ansible.builtin.fetch:
+            src: /data/backup_source/.jenkins-seed-current/seed.tar.gz
+            dest: "{{ playbook_dir }}/../.seed-transfer/seed.tar.gz"
+            flat: true
+          no_log: true
+
+- name: Restore only the fresh replicas from the prepared backup
+  hosts: seed_targets
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Refuse to replace a mounted datadir or repeat an interrupted restore
+      ansible.builtin.shell: |
+        set -eu
+        test ! -e /var/lib/mysql-before-seed
+        if mountpoint -q /var/lib/mysql; then
+          echo 'Fresh seeding must happen before the ZFS datadir migration.'
+          exit 1
+        fi
+      changed_when: false
+
+    - name: Read replica version
+      ansible.builtin.command:
+        argv: [mariadb, -N, -B, -e, "SELECT VERSION()"]
+      register: replica_seed_version
+      changed_when: false
+
+    - name: Require matching primary and replica versions
+      ansible.builtin.assert:
+        that:
+          - replica_seed_version.stdout.split('-')[0] == hostvars['primary'].seed_server_version.stdout.split('-')[0]
+        fail_msg: "Physical seeding requires matching server versions in this lab."
+
+    - name: Ensure rsync is installed
+      ansible.builtin.apt:
+        name: rsync
+        state: present
+
+    - name: Remove the previous transient restore workspace
+      ansible.builtin.file:
+        path: /var/tmp/.jenkins-seed-current
+        state: absent
+
+    - name: Create a private restore workspace
+      ansible.builtin.file:
+        path: /var/tmp/.jenkins-seed-current
+        state: directory
+        mode: "0700"
+
+    - name: Transfer the prepared seed archive
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../.seed-transfer/seed.tar.gz"
+        dest: /var/tmp/.jenkins-seed-current/seed.tar.gz
+        mode: "0600"
+      no_log: true
+
+    - name: Extract the prepared backup
+      ansible.builtin.unarchive:
+        src: /var/tmp/.jenkins-seed-current/seed.tar.gz
+        dest: /var/tmp/.jenkins-seed-current
+        remote_src: true
+
+    - name: Check restore disk headroom
+      ansible.builtin.shell: |
+        set -eu
+        required=$(du -sb /var/tmp/.jenkins-seed-current/backup | awk '{print $1}')
+        available=$(df -B1 --output=avail /var/lib/mysql | tail -n 1)
+        test "$available" -gt "$((required + 1073741824))"
+      changed_when: false
+
+    - name: Stop the fresh replica before restoring
+      ansible.builtin.systemd_service:
+        name: mariadb
+        state: stopped
+
+    - name: Preserve initial data and restore prepared database files
+      ansible.builtin.shell: |
+        set -eu
+        test ! -e /var/lib/mysql-before-seed
+        if pgrep -x mariadbd >/dev/null; then exit 1; fi
+        mv /var/lib/mysql /var/lib/mysql-before-seed
+        mkdir /var/lib/mysql
+        rsync -aH --numeric-ids \
+          --exclude='xtrabackup*' --exclude='mariadb_backup*' \
+          --exclude='backup-my.cnf' --exclude='master.info' \
+          --exclude='relay-log.info' --exclude='multi-master.info' \
+          --exclude='mariadb-bin.*' --exclude='mariadb-relay.*' \
+          /var/tmp/.jenkins-seed-current/backup/ /var/lib/mysql/
+        chown -R mysql:mysql /var/lib/mysql
+      changed_when: true
+
+    - name: Start the restored replica
+      ansible.builtin.systemd_service:
+        name: mariadb
+        state: started
+
+    - name: Set the backup GTID position without generating local binlog events
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - "SET SESSION sql_log_bin = 0"
+          - "SET GLOBAL gtid_slave_pos = '{{ hostvars['primary'].lab_seed_gtid }}'"
+
+- name: Establish and verify current replica connections
+  hosts: replicas
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    - name: Inspect the replication channel
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: channel
+
+    - name: Configure a seeded replica using its backup GTID position
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: changeprimary
+        primary_host: "{{ hostvars['primary'].ansible_host }}"
+        primary_user: lab_repl
+        primary_password: "{{ lab_repl_password }}"
+        primary_port: 3306
+        primary_use_gtid: replica_pos
+      when: channel.query_result[0] | length == 0
+      no_log: true
+
+    - name: Start replication
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: startreplica
+
+    - name: Wait for replication to catch up
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: replication_status
+      until:
+        - replication_status.query_result[0] | length == 1
+        - replication_status.query_result[0][0].Slave_IO_Running == 'Yes'
+        - replication_status.query_result[0][0].Slave_SQL_Running == 'Yes'
+        - replication_status.query_result[0][0].Seconds_Behind_Master is not none
+        - replication_status.query_result[0][0].Seconds_Behind_Master | int == 0
+      retries: 60
+      delay: 5
+
+    - name: Report replication health
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: IO=Yes, SQL=Yes, lag=0"
+
+- name: Configure MaxScale and test a write through the proxy
+  hosts: proxy
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    - name: Write the dynamic MaxScale configuration
+      ansible.builtin.template:
+        src: templates/maxscale.cnf.j2
+        dest: /etc/maxscale.cnf
+        owner: root
+        group: maxscale
+        mode: "0640"
+      notify: Restart MaxScale
+      no_log: true
+
+    - name: Apply configuration changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start MaxScale
+      ansible.builtin.systemd_service:
+        name: maxscale
+        enabled: true
+        state: started
+
+    - name: Wait for the database listener
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 3306
+        timeout: 60
+
+    - name: Insert this build's marker through MaxScale
+      community.mysql.mysql_query:
+        login_host: 127.0.0.1
+        login_port: 3306
+        login_user: lab_app
+        login_password: "{{ lab_app_password }}"
+        config_file: ""
+        query: |
+          INSERT INTO lab.pipeline_checks (marker)
+          VALUES (%s)
+          ON DUPLICATE KEY UPDATE marker = VALUES(marker)
+        positional_args:
+          - "{{ lab_test_marker }}"
+      register: proxy_write
+      until: proxy_write is succeeded
+      retries: 30
+      delay: 2
+      no_log: true
+
+    - name: Report successful proxy write
+      ansible.builtin.debug:
+        msg: "Write through MaxScale succeeded: {{ lab_test_marker }}"
+
+  handlers:
+    - name: Restart MaxScale
+      ansible.builtin.systemd_service:
+        name: maxscale
+        state: restarted
+
+- name: Verify the proxy write reached every database node
+  hosts: database
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    - name: Wait for the build marker
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: |
+          SELECT COUNT(*) AS marker_count
+          FROM lab.pipeline_checks
+          WHERE marker = %s
+        positional_args:
+          - "{{ lab_test_marker }}"
+      register: marker_result
+      until: marker_result.query_result[0][0].marker_count | int == 1
+      retries: 30
+      delay: 2
+
+    - name: Report verified data
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} contains {{ lab_test_marker }}"
+
+- name: Remove successful transient seed backups
+  hosts: primary:seed_targets
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Remove primary seed workspace
+      ansible.builtin.file:
+        path: /data/backup_source/.jenkins-seed-current
+        state: absent
+      when: inventory_hostname == 'primary' and groups.get('seed_targets', []) | length > 0
+
+    - name: Remove replica seed workspace
+      ansible.builtin.file:
+        path: /var/tmp/.jenkins-seed-current
+        state: absent
+      when: inventory_hostname != 'primary'
