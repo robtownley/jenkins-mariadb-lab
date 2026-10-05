@@ -6,9 +6,10 @@ with open("nodes.json") as source:
 
 hosts = {}
 for role, node in nodes.items():
-    hosts[role] = {
+        hosts[role] = {
         "ansible_host": node["private_ip"],
         "lab_role": role,
+        "zfs_volume_ids": node.get("zfs_volume_ids", []),
     }
 
 inventory = {
