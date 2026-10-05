@@ -136,6 +136,18 @@ pipeline {
                 '''
             }
         }
+        stage('Prepare ZFS mirrors') {
+            when {
+                expression { params.ACTION == 'APPLY' }
+            }
+            steps {
+                sh '''
+                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                        -i inventory.json \
+                        ansible/prepare_zfs.yml
+                '''
+            }
+        }
         stage('Configure hostnames and SSH hopping') {
             when {
                 expression { params.ACTION == 'APPLY' }
