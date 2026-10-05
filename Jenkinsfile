@@ -248,6 +248,30 @@ pipeline {
                 '''
             }
         }
+        stage('Move logs and temporary files to ZFS datasets') {
+            when {
+                expression { params.ACTION == 'APPLY' }
+            }
+            steps {
+                sh '''
+                    set -eu
+
+                    for node in replica1 replica2 primary; do
+                        echo "Checking log and temporary paths on $node"
+
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                            -i inventory.json \
+                            ansible/migrate_mysql_log_paths.yml \
+                            --limit "$node"
+                    done
+
+                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                        -i inventory.json \
+                        ansible/migrate_mysql_log_paths.yml \
+                        --limit 'replica1,replica2'
+                '''
+            }
+        }
     }
 
     post {
