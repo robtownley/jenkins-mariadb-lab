@@ -1,0 +1,44 @@
+---
+- name: Verify replication after database maintenance
+  hosts: replicas
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Wait for replicas to reconnect and catch up
+      block:
+        - name: Read replication health with recovery retries
+          community.mysql.mysql_query:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            query: SHOW SLAVE STATUS
+          register: replication_health
+          changed_when: false
+          vars:
+            channel: "{{ ((replication_health.query_result | default([[]], true))[0] | first) | default({}) }}"
+          until:
+            - replication_health is succeeded
+            - (replication_health.query_result | default([[]], true))[0] | length == 1
+            - channel.Slave_IO_Running | default('') == 'Yes'
+            - channel.Slave_SQL_Running | default('') == 'Yes'
+            - channel.Seconds_Behind_Master | default(none) != none
+            - channel.Seconds_Behind_Master | default(-1) | int == 0
+            - channel.Last_IO_Errno | default(-1) | int == 0
+            - channel.Last_SQL_Errno | default(-1) | int == 0
+          retries: 60
+          delay: 5
+
+      rescue:
+        - name: Report replication status when recovery times out
+          ansible.builtin.debug:
+            msg:
+              node: "{{ inventory_hostname }}"
+              status: "{{ replication_health.query_result | default([]) }}"
+              error: "{{ replication_health.msg | default('') }}"
+
+        - name: Stop when replication has not recovered
+          ansible.builtin.fail:
+            msg: "{{ inventory_hostname }} did not recover healthy replication. Review the status above before continuing."
+
+    - name: Report healthy replication
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: IO=Yes, SQL=Yes, lag=0, no replication errors."
