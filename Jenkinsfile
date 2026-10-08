@@ -254,7 +254,7 @@ PYSEED
         stage('Verify replicas after migration') {
             when { expression { params.ACTION == 'APPLY' } }
             steps {
-                sh '/opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/migrate_mysql_zfs.yml --limit replicas'
+                sh '/opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/verify_replication.yml --limit replicas'
             }
         }
 
@@ -268,7 +268,7 @@ PYSEED
                             -i inventory.json ansible/migrate_mysql_log_paths.yml --limit "$node"
                     done < database-order.txt
                     /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                        -i inventory.json ansible/migrate_mysql_log_paths.yml --limit replicas
+                        -i inventory.json ansible/verify_replication.yml --limit replicas
                 '''
             }
         }
@@ -283,7 +283,7 @@ PYSEED
                             -i inventory.json ansible/migrate_mysql_redo.yml --limit "$node"
                     done < database-order.txt
                     /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                        -i inventory.json ansible/migrate_mysql_redo.yml --limit replicas
+                        -i inventory.json ansible/verify_replication.yml --limit replicas
                 '''
             }
         }
