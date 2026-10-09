@@ -321,6 +321,24 @@ PYSEED
             }
         }
 
+        stage('Configure Shattered Silicon Monitoring') {
+            when { expression { params.ACTION == 'APPLY' } }
+            steps {
+                withCredentials([
+                    string(credentialsId: 'mariadb-lab-ssm-password', variable: 'LAB_SSM_PASSWORD'),
+                    string(credentialsId: 'mariadb-lab-ssm-mysql-password', variable: 'LAB_SSM_MYSQL_PASSWORD')
+                ]) {
+                    sh '''
+                        set +x
+                        set -eu
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/configure_ssm_server.yml
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/public_ssm.yml
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/configure_ssm_clients.yml
+                    '''
+                }
+            }
+        }
+
     }
 
     post {
