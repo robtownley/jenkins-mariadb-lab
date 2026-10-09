@@ -281,7 +281,10 @@ resource "aws_instance" "monitor" {
   subnet_id = local.subnet_id
   associate_public_ip_address = true
   key_name = aws_key_pair.lab.key_name
-  vpc_security_group_ids = [aws_security_group.monitor.id]
+  vpc_security_group_ids = [
+    aws_security_group.monitor.id,
+    aws_security_group.lab_ssh.id
+  ]
   root_block_device {
     volume_size = 20
     volume_type = "gp3"
