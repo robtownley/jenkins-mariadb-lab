@@ -1,0 +1,123 @@
+---
+- name: Configure automatic snapshots on MariaDB replicas
+  hosts: replicas
+  become: true
+  any_errors_fatal: true
+
+  tasks:
+    - name: Require a healthy pool
+      ansible.builtin.command: zpool list -H -o health data
+      register: snapshot_pool
+      changed_when: false
+      failed_when: snapshot_pool.rc != 0 or snapshot_pool.stdout | trim != 'ONLINE'
+
+    - name: Require the database datasets at their final mountpoints
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - -rn
+          - -t
+          - zfs
+          - -S
+          - "{{ item.dataset }}"
+          - -M
+          - "{{ item.mountpoint }}"
+      loop:
+        - {dataset: data/mysql, mountpoint: /var/lib/mysql}
+        - {dataset: data/mysql/.ibd, mountpoint: /var/lib/mysql/.ibd}
+        - {dataset: data/mysql/.log, mountpoint: /var/lib/mysql/.log}
+        - {dataset: data/mysql/.tmp, mountpoint: /var/lib/mysql/.tmp}
+      changed_when: false
+
+    - name: Install Ubuntu Sanoid package
+      ansible.builtin.apt:
+        name: sanoid
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create Sanoid configuration directory
+      ansible.builtin.file:
+        path: /etc/sanoid
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Configure hourly and daily retention for the database tree
+      ansible.builtin.copy:
+        dest: /etc/sanoid/sanoid.conf
+        owner: root
+        group: root
+        mode: '0644'
+        backup: true
+        content: |
+          # Managed by the Jenkins MariaDB lab.
+          # Atomic recursive snapshots include redo, binlogs and temp datasets.
+          [data/mysql]
+              use_template = mariadb_lab
+              recursive = zfs
+
+          [template_mariadb_lab]
+              frequently = 0
+              hourly = 24
+              daily = 1
+              weekly = 0
+              monthly = 0
+              yearly = 0
+              autosnap = yes
+              autoprune = yes
+
+    - name: Locate the installed Sanoid executable
+      ansible.builtin.shell: command -v sanoid
+      register: sanoid_executable
+      changed_when: false
+
+    - name: Create the Sanoid service override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/sanoid.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Ensure scheduled runs both snapshot and prune
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/sanoid.service.d/lab.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart={{ sanoid_executable.stdout | trim }} --cron
+
+    - name: Enable the package-provided Sanoid timer
+      ansible.builtin.systemd_service:
+        name: sanoid.timer
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Run an initial snapshot and retention check through the service
+      ansible.builtin.systemd_service:
+        name: sanoid.service
+        state: started
+
+    - name: Read current database snapshots
+      ansible.builtin.command:
+        argv: [zfs, list, -H, -t, snapshot, -o, name, -r, data/mysql]
+      register: database_snapshots
+      changed_when: false
+
+    - name: Confirm Sanoid created an hourly database snapshot
+      ansible.builtin.assert:
+        that:
+          - database_snapshots.stdout is search('(?m)^data/mysql@autosnap_.*_hourly$')
+        fail_msg: 'Sanoid did not create an hourly snapshot. Check journalctl -u sanoid.service.'
+
+    - name: Report snapshot retention and current snapshots
+      ansible.builtin.debug:
+        msg:
+          node: '{{ inventory_hostname }}'
+          retention: '24 hourly and 1 daily; no weekly, monthly or yearly snapshots'
+          consistency: 'Atomic ZFS filesystem snapshots of the running database; restore requires InnoDB recovery and validation'
+          snapshots: '{{ database_snapshots.stdout_lines }}'
