@@ -19,6 +19,7 @@ for role, node in nodes.items():
     hosts[role] = {
         "ansible_host": node["private_ip"],
         "lab_role": role,
+        "dashboard_public_ip": node.get("public_ip", ""),
         "zfs_volume_ids": node.get("zfs_volume_ids", []),
     }
     if role == "primary":
