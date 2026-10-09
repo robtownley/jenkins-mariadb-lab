@@ -127,6 +127,20 @@ resource "aws_security_group" "database" {
     protocol        = "tcp"
     security_groups = [aws_security_group.monitor.id]
   }
+  ingress {
+    description = "SSM system metrics scrape"
+    from_port = 42000
+    to_port = 42000
+    protocol = "tcp"
+    security_groups = [aws_security_group.ssm.id]
+  }
+  ingress {
+    description = "SSM MySQL metrics scrape"
+    from_port = 42002
+    to_port = 42002
+    protocol = "tcp"
+    security_groups = [aws_security_group.ssm.id]
+  }
   egress {
     from_port   = 0
     to_port     = 0
@@ -240,6 +254,12 @@ output "nodes" {
     private_ip = aws_instance.monitor.private_ip
     public_ip = aws_instance.monitor.public_ip
     zfs_volume_ids = []
+  }, ssm = {
+    name = "mariadb-ssm"
+    instance_id = aws_instance.ssm.id
+    private_ip = aws_instance.ssm.private_ip
+    public_ip = aws_instance.ssm.public_ip
+    zfs_volume_ids = []
   } })
   depends_on = [aws_volume_attachment.mysql_zfs]
 }
@@ -312,3 +332,53 @@ resource "aws_instance" "monitor" {
   lifecycle { ignore_changes = [ami] }
 }
 output "monitor_private_ip" { value = aws_instance.monitor.private_ip }
+
+resource "aws_security_group" "ssm" {
+  name = "jenkins-mariadb-lab-ssm"
+  description = "Shattered Silicon Monitoring"
+  vpc_id = local.vpc_id
+  ingress {
+    from_port = 22
+    to_port = 22
+    protocol = "tcp"
+    security_groups = [local.jenkins_sg_id]
+  }
+  ingress {
+    from_port = 80
+    to_port = 80
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port = 443
+    to_port = 443
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = { Name = "mariadb-ssm", Project = "mariadb-jenkins-lab" }
+}
+resource "aws_instance" "ssm" {
+  ami = data.aws_ami.ubuntu.id
+  instance_type = "m6i.large"
+  subnet_id = local.subnet_id
+  associate_public_ip_address = true
+  key_name = aws_key_pair.lab.key_name
+  vpc_security_group_ids = [aws_security_group.ssm.id, aws_security_group.lab_ssh.id]
+  root_block_device {
+    volume_size = 60
+    volume_type = "gp3"
+    encrypted = true
+    delete_on_termination = true
+    tags = { Project = "mariadb-jenkins-lab", Name = "mariadb-ssm-root" }
+  }
+  metadata_options { http_tokens = "required" }
+  tags = { Name = "mariadb-ssm", Project = "mariadb-jenkins-lab" }
+  lifecycle { ignore_changes = [ami] }
+}
+output "ssm_url" { value = "https://ssm.roblabb.com" }
