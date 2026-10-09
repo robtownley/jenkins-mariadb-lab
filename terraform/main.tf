@@ -79,6 +79,13 @@ resource "aws_security_group" "maxscale" {
     protocol        = "tcp"
     security_groups = [local.jenkins_sg_id]
   }
+  ingress {
+    description     = "Proxy health from monitoring server"
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.monitor.id]
+  }
   egress {
     from_port   = 0
     to_port     = 0
@@ -112,6 +119,13 @@ resource "aws_security_group" "database" {
     to_port         = 3306
     protocol        = "tcp"
     security_groups = [aws_security_group.maxscale.id]
+  }
+  ingress {
+    description     = "Database health from monitoring server"
+    from_port       = 9109
+    to_port         = 9109
+    protocol        = "tcp"
+    security_groups = [aws_security_group.monitor.id]
   }
   egress {
     from_port   = 0
@@ -208,7 +222,7 @@ resource "aws_volume_attachment" "mysql_zfs" {
 }
 
 output "nodes" {
-  value = {
+  value = merge({
     for role, instance in aws_instance.node : role => {
       name        = local.nodes[role]
       instance_id = instance.id
@@ -220,6 +234,13 @@ output "nodes" {
       ]
     }
   }
+  , { monitor = {
+    name = "mariadb-monitor"
+    instance_id = aws_instance.monitor.id
+    private_ip = aws_instance.monitor.private_ip
+    public_ip = aws_instance.monitor.public_ip
+    zfs_volume_ids = []
+  } })
   depends_on = [aws_volume_attachment.mysql_zfs]
 }
 
@@ -235,3 +256,42 @@ output "mysql_zfs_volumes" {
     }
   }
 }
+
+resource "aws_security_group" "monitor" {
+  name = "jenkins-mariadb-lab-monitor"
+  description = "Monitoring SSH access"
+  vpc_id = local.vpc_id
+  ingress {
+    from_port = 22
+    to_port = 22
+    protocol = "tcp"
+    security_groups = [local.jenkins_sg_id]
+  }
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = { Name = "mariadb-monitor", Project = "mariadb-jenkins-lab" }
+}
+resource "aws_instance" "monitor" {
+  ami = data.aws_ami.ubuntu.id
+  instance_type = "t3.micro"
+  subnet_id = local.subnet_id
+  associate_public_ip_address = true
+  key_name = aws_key_pair.lab.key_name
+  vpc_security_group_ids = [aws_security_group.monitor.id]
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+    encrypted = true
+    delete_on_termination = true
+    tags = { Project = "mariadb-jenkins-lab", Name = "mariadb-monitor-root" }
+  }
+  metadata_options { http_tokens = "required" }
+  credit_specification { cpu_credits = "standard" }
+  tags = { Name = "mariadb-monitor", Project = "mariadb-jenkins-lab" }
+  lifecycle { ignore_changes = [ami] }
+}
+output "monitor_private_ip" { value = aws_instance.monitor.private_ip }
