@@ -25,13 +25,13 @@ if plan_path.exists():
     lines.extend(['',f'Terraform resources: {totals["create"]} additions, {totals["update"]} updates, {totals["delete"]} deletions.'])
 else: lines.append('No Terraform plan available; build stopped before a plan was saved.')
 if success and action=='APPLY':
-    lines.extend(['','Dashboard: https://dashboard.roblabb.com','Login: rob (password stored in Jenkins credential)',''])
+    lines.extend(['','Dashboard: https://dashboard.roblabb.com','SSM metrics: https://ssm.roblabb.com','Login: rob (password stored in Jenkins credential)',''])
     nodes_path=Path('nodes.json')
     if nodes_path.exists():
         nodes=json.loads(nodes_path.read_text())
         lines.append(f'Active instances: {len(nodes)}')
         for name,n in nodes.items():lines.append(f'  {name}: {n["instance_id"]}; private={n["private_ip"]}; public={n.get("public_ip", "")}')
-    lines.extend(['','Configuration stages completed (some tasks may already have been correct):','  Jenkins hosts, instance hostnames and SSH hopping','  MariaDB/MaxScale installation, topology configuration and verification','  Seed planning; data seeding only where required and approved','  ZFS mirrors, datadir/log/temp/redo path migration checks','  Replica replication verification','  Sanoid: 24 hourly and 1 daily snapshots per replica','  Monitoring inventory and health endpoints','  HTTPS dashboard, password authentication and certificate renewal'])
+    lines.extend(['','Configuration stages completed (some tasks may already have been correct):','  Jenkins hosts, instance hostnames and SSH hopping','  MariaDB/MaxScale installation, topology configuration and verification','  Seed planning; data seeding only where required and approved','  ZFS mirrors, datadir/log/temp/redo path migration checks','  Replica replication verification','  Sanoid: 24 hourly and 1 daily snapshots per replica','  Monitoring inventory and health endpoints','  HTTPS dashboard, password authentication and certificate renewal','  Shattered Silicon Monitoring server and OS/MySQL metrics on database nodes'])
 elif success and action=='DESTROY':
     lines.extend(['','Lab resources and Terraform-managed DNS records removed.','Jenkins instance and the Route 53 hosted zone remain.','Dashboard is no longer deployed.'])
 elif success and action=='PLAN':lines.extend(['','Preview only: no infrastructure or configuration changes applied.'])
