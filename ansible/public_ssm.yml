@@ -1,0 +1,151 @@
+---
+- name: Publish authenticated HTTPS SSM
+  hosts: ssm_monitoring
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Require the Jenkins ssm password
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'LAB_SSM_PASSWORD') | length >= 16
+          - "'\n' not in lookup('env', 'LAB_SSM_PASSWORD')"
+        fail_msg: 'Create mariadb-lab-ssm-password as a Jenkins Secret text credential, at least 16 characters.'
+      no_log: true
+    - name: Install web proxy and certificate tools
+      ansible.builtin.apt:
+        name: [nginx, certbot, apache2-utils]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+    - name: Create challenge webroot
+      ansible.builtin.file:
+        path: /var/www/letsencrypt
+        state: directory
+        mode: '0755'
+    - name: Store ssm password as a bcrypt hash
+      ansible.builtin.command:
+        argv: [htpasswd, -i, -c, -B, /etc/nginx/ssm.htpasswd, rob]
+        stdin: "{{ lookup('env', 'LAB_SSM_PASSWORD') }}"
+      no_log: true
+    - name: Restrict password file access
+      ansible.builtin.file:
+        path: /etc/nginx/ssm.htpasswd
+        owner: root
+        group: www-data
+        mode: '0640'
+    - name: Check whether a certificate already exists
+      ansible.builtin.stat:
+        path: /etc/letsencrypt/live/ssm.roblabb.com/fullchain.pem
+      register: ssm_cert
+    - name: Install challenge-only bootstrap site
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/lab-ssm
+        content: |
+          server {
+            listen 80;
+            server_name ssm.roblabb.com;
+            location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }
+            location / { return 503; }
+          }
+      when: not ssm_cert.stat.exists
+    - name: Enable ssm site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/lab-ssm
+        dest: /etc/nginx/sites-enabled/lab-ssm
+        state: link
+    - name: Remove default Nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+    - name: Validate web configuration before certificate request
+      ansible.builtin.command: nginx -t
+      changed_when: false
+    - name: Start web proxy
+      ansible.builtin.systemd_service:
+        name: nginx
+        enabled: true
+        state: restarted
+    - name: Wait for public DNS to point to this monitor
+      ansible.builtin.command:
+        argv: [python3, -c, "import socket; assert '{{ dashboard_public_ip }}' in socket.gethostbyname_ex('ssm.roblabb.com')[2]"]
+      register: ssm_dns
+      changed_when: false
+      until: ssm_dns.rc == 0
+      retries: 30
+      delay: 10
+    - name: Obtain or retain ssm certificate
+      ansible.builtin.command:
+        argv:
+          - certbot
+          - certonly
+          - --webroot
+          - -w
+          - /var/www/letsencrypt
+          - -d
+          - ssm.roblabb.com
+          - --cert-name
+          - ssm.roblabb.com
+          - --non-interactive
+          - --agree-tos
+          - --register-unsafely-without-email
+          - --keep-until-expiring
+      register: certificate_run
+      changed_when: "'not yet due for renewal' not in certificate_run.stdout"
+    - name: Configure HTTPS proxy with authentication
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/lab-ssm
+        content: |
+          server {
+            listen 80;
+            server_name ssm.roblabb.com;
+            location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }
+            location / { return 301 https://ssm.roblabb.com$request_uri; }
+          }
+          server {
+            listen 443 ssl;
+            server_name ssm.roblabb.com;
+            ssl_certificate /etc/letsencrypt/live/ssm.roblabb.com/fullchain.pem;
+            ssl_certificate_key /etc/letsencrypt/live/ssm.roblabb.com/privkey.pem;
+            ssl_protocols TLSv1.2 TLSv1.3;
+            auth_basic "Rob's MariaDB lab";
+            auth_basic_user_file /etc/nginx/ssm.htpasswd;
+            location / {
+              proxy_pass http://127.0.0.1:8081;
+              proxy_set_header Host $host;
+              proxy_set_header X-Forwarded-Proto https;
+              proxy_set_header Authorization $http_authorization;
+            }
+          }
+    - name: Validate final web configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+    - name: Reload HTTPS proxy
+      ansible.builtin.systemd_service:
+        name: nginx
+        state: reloaded
+    - name: Install certificate renewal reload hook
+      ansible.builtin.copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/reload-lab-nginx
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          set -eu
+          /usr/sbin/nginx -t
+          /usr/bin/systemctl reload nginx
+    - name: Enable automatic certificate renewal
+      ansible.builtin.systemd_service:
+        name: certbot.timer
+        enabled: true
+        state: started
+    - name: Confirm unauthenticated requests are blocked
+      ansible.builtin.uri:
+        url: https://ssm.roblabb.com/ping
+        status_code: 401
+    - name: Verify authenticated HTTPS ssm
+      ansible.builtin.uri:
+        url: https://ssm.roblabb.com/ping
+        url_username: rob
+        url_password: "{{ lookup('env', 'LAB_SSM_PASSWORD') }}"
+        force_basic_auth: true
+        status_code: 200
+      no_log: true
