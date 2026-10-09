@@ -100,7 +100,7 @@ pipeline {
             when { expression { params.ACTION != 'PLAN' } }
             steps {
                 dir('terraform') {
-                    sh 'terraform apply -no-color -lock-timeout=60s tfplan'
+                    sh 'terraform apply -no-color -lock-timeout=60s tfplan && touch ../infrastructure-applied'
                 }
             }
         }
@@ -307,10 +307,31 @@ PYSEED
             }
         }
 
+
+        stage('Publish HTTPS dashboard') {
+            when { expression { params.ACTION == 'APPLY' } }
+            steps {
+                withCredentials([string(credentialsId: 'mariadb-lab-dashboard-password', variable: 'LAB_DASHBOARD_PASSWORD')]) {
+                    sh '''
+                        set +x
+                        set -eu
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/public_dashboard.yml
+                    '''
+                }
+            }
+        }
+
     }
 
     post {
-        success { echo "Lab action completed: ${params.ACTION}, replicas=${params.REPLICA_COUNT ?: '2'}" }
+        success {
+            sh 'python3 scripts/build_summary.py --result SUCCESS'
+            archiveArtifacts artifacts: 'lab-summary.txt', allowEmptyArchive: true
+        }
+        failure {
+            sh 'python3 scripts/build_summary.py --result FAILURE'
+            archiveArtifacts artifacts: 'lab-summary.txt', allowEmptyArchive: true
+        }
         always {
             sh 'rm -f terraform/tfplan terraform/tfplan.json .seed-transfer/seed.tar.gz .seed-transfer/seed.zfs seed-plan.json'
         }
