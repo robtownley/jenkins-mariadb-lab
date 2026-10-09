@@ -12,6 +12,7 @@ locals {
   lab_dns_addresses = merge(
     { for role, node in aws_instance.node : role => node.public_ip },
     {
+      ssm       = aws_instance.ssm.public_ip
       monitor   = aws_instance.monitor.public_ip
       dashboard = aws_instance.monitor.public_ip
       jenkins   = data.aws_instance.jenkins_dns.public_ip
