@@ -1,0 +1,49 @@
+---
+- name: Install dedicated Shattered Silicon Monitoring server
+  hosts: ssm_monitoring
+  become: true
+  tasks:
+    - name: Wait for server connection
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+    - name: Validate server credential
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'LAB_SSM_PASSWORD') | length >= 16
+          - "'\n' not in lookup('env', 'LAB_SSM_PASSWORD')"
+      no_log: true
+    - name: Install Docker
+      ansible.builtin.apt:
+        name: docker.io
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+    - name: Enable Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+    - name: Install container configuration helper
+      ansible.builtin.copy:
+        src: files/ensure_ssm_server.py
+        dest: /usr/local/sbin/ensure-ssm-server
+        mode: '0700'
+    - name: Start SSM while preserving its data container
+      ansible.builtin.command: /usr/bin/python3 /usr/local/sbin/ensure-ssm-server
+      environment:
+        LAB_SSM_PASSWORD: "{{ lookup('env', 'LAB_SSM_PASSWORD') }}"
+      register: ssm_container
+      changed_when: "'SSM_CREATED' in ssm_container.stdout or 'SSM_STARTED' in ssm_container.stdout"
+      no_log: true
+    - name: Wait for authenticated SSM API
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8081/ping
+        url_username: rob
+        url_password: "{{ lookup('env', 'LAB_SSM_PASSWORD') }}"
+        force_basic_auth: true
+        status_code: 200
+      register: ssm_ping
+      until: ssm_ping.status | default(0) == 200
+      retries: 60
+      delay: 5
+      no_log: true
