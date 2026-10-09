@@ -1,0 +1,121 @@
+---
+- name: Install local database health endpoints
+  hosts: database
+  become: true
+  tasks:
+    - name: Install health endpoint
+      ansible.builtin.copy:
+        src: files/lab_health.py
+        dest: /usr/local/sbin/mariadb-lab-health
+        mode: '0755'
+      notify: Restart health endpoint
+    - name: Install health service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mariadb-lab-health.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=MariaDB lab read-only health endpoint
+          After=network.target mariadb.service
+          [Service]
+          ExecStart=/usr/bin/python3 /usr/local/sbin/mariadb-lab-health
+          Restart=always
+          RestartSec=5
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          PrivateTmp=true
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart health endpoint
+    - name: Enable health endpoint
+      ansible.builtin.systemd_service:
+        name: mariadb-lab-health
+        daemon_reload: true
+        enabled: true
+        state: started
+    - ansible.builtin.meta: flush_handlers
+  handlers:
+    - name: Restart health endpoint
+      ansible.builtin.systemd_service:
+        name: mariadb-lab-health
+        daemon_reload: true
+        state: restarted
+
+- name: Configure monitoring dashboard
+  hosts: monitoring
+  become: true
+  tasks:
+    - name: Wait for monitor SSH connection
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+    - name: Create dashboard user
+      ansible.builtin.user:
+        name: labmonitor
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+    - name: Create configuration directory
+      ansible.builtin.file:
+        path: /etc/mariadb-lab-monitor
+        state: directory
+        mode: '0755'
+    - name: Write current cluster membership
+      ansible.builtin.copy:
+        dest: /etc/mariadb-lab-monitor/nodes.json
+        mode: '0644'
+        content: |
+          [
+          {% for node in groups['database'] + groups['proxy'] %}
+          {{ {'name': node, 'role': hostvars[node].lab_role, 'ip': hostvars[node].ansible_host} | to_json }}{{ ',' if not loop.last else '' }}
+          {% endfor %}
+          ]
+      notify: Restart dashboard
+    - name: Install dashboard
+      ansible.builtin.copy:
+        src: files/lab_dashboard.py
+        dest: /usr/local/sbin/mariadb-lab-dashboard
+        mode: '0755'
+      notify: Restart dashboard
+    - name: Install dashboard service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mariadb-lab-dashboard.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=MariaDB cluster monitoring dashboard
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          User=labmonitor
+          ExecStart=/usr/bin/python3 /usr/local/sbin/mariadb-lab-dashboard
+          Restart=always
+          RestartSec=5
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          PrivateTmp=true
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart dashboard
+    - name: Enable dashboard
+      ansible.builtin.systemd_service:
+        name: mariadb-lab-dashboard
+        daemon_reload: true
+        enabled: true
+        state: started
+    - ansible.builtin.meta: flush_handlers
+    - name: Verify dashboard HTTP endpoint
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8081/api/health
+        return_content: true
+      register: dashboard_http
+      until: dashboard_http.status | default(0) == 200
+      retries: 12
+      delay: 5
+  handlers:
+    - name: Restart dashboard
+      ansible.builtin.systemd_service:
+        name: mariadb-lab-dashboard
+        daemon_reload: true
+        state: restarted
