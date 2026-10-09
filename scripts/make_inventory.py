@@ -7,7 +7,7 @@ nodes = json.loads(Path("nodes.json").read_text())
 if "primary" not in nodes or "maxscale" not in nodes:
     raise SystemExit("Terraform output must include primary and maxscale.")
 
-unexpected = [name for name in nodes if name not in ("primary", "maxscale")
+unexpected = [name for name in nodes if name not in ("primary", "maxscale", "monitor")
               and not re.fullmatch(r"replica[1-9][0-9]*", name)]
 if unexpected:
     raise SystemExit(f"Unexpected node names: {unexpected}")
@@ -43,6 +43,7 @@ inventory = {
                 "replicas": {"hosts": {name: hosts[name] for name in replicas}},
             }},
             "proxy": {"hosts": {"maxscale": hosts["maxscale"]}},
+            "monitoring": {"hosts": {"monitor": hosts["monitor"]} if "monitor" in hosts else {}},
         },
     }
 }
