@@ -24,6 +24,8 @@ def entries(nodes):
     for role, node in nodes.items():
         if role == 'primary':
             alias, order = 'mariadb-primary', (0, 0)
+        elif role == 'monitor':
+            alias, order = 'mariadb-monitor', (3, 0)
         elif role == 'maxscale':
             alias, order = 'mariadb-maxscale', (2, 0)
         elif re.fullmatch(r'replica[1-9][0-9]?', role):
