@@ -300,6 +300,13 @@ PYSEED
             }
         }
 
+        stage('Configure cluster monitoring') {
+            when { expression { params.ACTION == 'APPLY' } }
+            steps {
+                sh '/opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/configure_monitoring.yml'
+            }
+        }
+
     }
 
     post {
