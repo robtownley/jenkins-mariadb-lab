@@ -24,6 +24,8 @@ def entries(nodes):
     for role, node in nodes.items():
         if role == 'primary':
             alias, order = 'mariadb-primary', (0, 0)
+        elif role == 'ssm':
+            alias, order = 'mariadb-ssm', (4, 0)
         elif role == 'monitor':
             alias, order = 'mariadb-monitor', (3, 0)
         elif role == 'maxscale':
