@@ -1,0 +1,121 @@
+---
+- name: Install system and MySQL metrics on primary and replicas
+  hosts: database
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Require credentials
+      ansible.builtin.assert:
+        that:
+          - lookup('env', 'LAB_SSM_PASSWORD') | length >= 16
+          - lookup('env', 'LAB_SSM_MYSQL_PASSWORD') is match('^[0-9a-fA-F]{32}$')
+        fail_msg: 'SSM server password must be at least 16 characters and the database secret must be 32 hexadecimal characters.'
+      no_log: true
+    - name: Install repository dependencies
+      ansible.builtin.apt:
+        name: [ca-certificates, python3-pymysql]
+        state: present
+    - name: Download official SSM 9.5 signing key
+      ansible.builtin.get_url:
+        url: https://dl.shatteredsilicon.net/ssm/9.5/DEBS/SS-SSM-9.5-archive-keyring.pgp
+        dest: /usr/share/keyrings/SS-SSM-9.5-archive-keyring.pgp
+        mode: '0644'
+    - name: Configure official SSM repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/ss-ssm-9.5.list
+        mode: '0644'
+        content: |
+          deb [signed-by=/usr/share/keyrings/SS-SSM-9.5-archive-keyring.pgp] https://dl.shatteredsilicon.net/ssm/9.5/DEBS/ stable main
+    - name: Install SSM client
+      ansible.builtin.apt:
+        name: ssm-client
+        state: present
+        update_cache: true
+    - name: Route SSM hostname to its private address for this client
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: '# {mark} SSM PRIVATE METRICS'
+        block: "{{ hostvars['ssm'].ansible_host }} ssm.roblabb.com"
+    - name: Create local metrics account without replicating account changes
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - SET SESSION sql_log_bin = 0
+          - "CREATE USER IF NOT EXISTS 'lab_ssm'@'localhost' IDENTIFIED BY '{{ lookup('env', 'LAB_SSM_MYSQL_PASSWORD') }}'"
+          - "ALTER USER 'lab_ssm'@'localhost' IDENTIFIED BY '{{ lookup('env', 'LAB_SSM_MYSQL_PASSWORD') }}' WITH MAX_USER_CONNECTIONS 10"
+          - "GRANT SELECT, PROCESS, BINLOG MONITOR, REPLICA MONITOR, SHOW VIEW ON *.* TO 'lab_ssm'@'localhost'"
+      no_log: true
+    - name: Configure authenticated TLS connection to SSM
+      ansible.builtin.command:
+        argv:
+          - ssm-admin
+          - config
+          - --client-name
+          - '{{ inventory_hostname }}'
+          - --client-address
+          - '{{ ansible_host }}'
+          - --server
+          - ssm.roblabb.com
+          - --server-ssl
+          - --server-user
+          - rob
+          - --server-password
+          - "{{ lookup('env', 'LAB_SSM_PASSWORD') }}"
+      no_log: true
+    - name: Read configured metrics services
+      ansible.builtin.command: ssm-admin list
+      register: ssm_services
+      changed_when: false
+    - name: Track metrics account credential version
+      ansible.builtin.copy:
+        dest: /etc/ssm-lab-mysql-password.sha256
+        content: "{{ lookup('env', 'LAB_SSM_MYSQL_PASSWORD') | hash('sha256') }}"
+        owner: root
+        group: root
+        mode: '0600'
+      register: ssm_password_version
+      no_log: true
+    - name: Refresh MySQL exporter credentials when changed
+      ansible.builtin.command: ssm-admin rm mysql:metrics
+      when:
+        - ssm_password_version.changed
+        - ssm_services.stdout is search('(?m)^\s*mysql:metrics\s')
+    - name: Refresh service list after credential reconciliation
+      ansible.builtin.command: ssm-admin list
+      register: ssm_services
+      changed_when: false
+    - name: Add OS and system metrics
+      ansible.builtin.command: ssm-admin add linux:metrics
+      when: ssm_services.stdout is not search('(?m)^\s*linux:metrics\s')
+    - name: Add MySQL metrics through the local socket
+      ansible.builtin.command:
+        argv:
+          - ssm-admin
+          - add
+          - mysql:metrics
+          - --user
+          - lab_ssm
+          - --password
+          - "{{ lookup('env', 'LAB_SSM_MYSQL_PASSWORD') }}"
+          - --socket
+          - /run/mysqld/mysqld.sock
+      when: ssm_services.stdout is not search('(?m)^\s*mysql:metrics\s')
+      no_log: true
+    - name: Ensure metrics services are running
+      ansible.builtin.command: ssm-admin start
+      changed_when: false
+    - name: Verify SSM network and exporter connectivity
+      ansible.builtin.command: ssm-admin check-network
+      register: ssm_network
+      changed_when: false
+      until: ssm_network.rc == 0
+      retries: 12
+      delay: 5
+    - name: Report registered monitoring services
+      ansible.builtin.command: ssm-admin list
+      register: registered_services
+      changed_when: false
+    - name: Report registration
+      ansible.builtin.debug:
+        msg: '{{ registered_services.stdout_lines }}'
