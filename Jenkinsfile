@@ -288,6 +288,18 @@ PYSEED
             }
         }
 
+
+        stage('Configure replica snapshot retention') {
+            when { expression { params.ACTION == 'APPLY' } }
+            steps {
+                sh '''
+                    set -eu
+                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                        -i inventory.json ansible/configure_sanoid.yml
+                '''
+            }
+        }
+
     }
 
     post {
