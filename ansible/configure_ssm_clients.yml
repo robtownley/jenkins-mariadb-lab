@@ -9,8 +9,8 @@
       ansible.builtin.assert:
         that:
           - lookup('env', 'LAB_SSM_PASSWORD') | length >= 16
-          - lookup('env', 'LAB_SSM_MYSQL_PASSWORD') is match('^[0-9a-fA-F]{32}$')
-        fail_msg: 'SSM server password must be at least 16 characters and the database secret must be 32 hexadecimal characters.'
+          - lookup('env', 'LAB_SSM_MYSQL_PASSWORD') is match('^[A-Za-z0-9]{16,}$')
+        fail_msg: 'SSM server password must be at least 16 characters; the MySQL metrics password must contain at least 16 letters or numbers.'
       no_log: true
     - name: Install repository dependencies
       ansible.builtin.apt:
