@@ -29,7 +29,7 @@
             cmd: '../scripts/create_zfs_seed.py probe'
             executable: /usr/bin/python3
           delegate_to: '{{ item }}'
-          loop: "{{ groups['replicas'] | difference(groups.get('seed_targets', [])) | sort }}"
+          loop: "{{ groups['intermediate_replicas'] | difference(groups.get('seed_targets', [])) | sort }}"
           register: donor_probes
           changed_when: false
           failed_when: false
@@ -143,6 +143,13 @@
           delegate_to: localhost
           become: false
 
+        - name: Require approval for the exact selected source and destination set
+          ansible.builtin.assert:
+            that:
+              - lookup('env', 'APPROVED_SEED_SOURCE') == seed_source
+              - (lookup('env', 'APPROVED_SEED_TARGETS').split(',') | sort) == (groups['seed_targets'] | sort)
+            fail_msg: 'Seed selection changed or was not approved. Rerun planning and approve the concrete donor and targets.'
+
         - name: Require the donor transfer dataset mount
           ansible.builtin.command:
             argv: [findmnt, -rn, -t, zfs, -S, data/backup_source, -M, /data/backup_source]
@@ -203,6 +210,18 @@
               delegate_to: maxscale
               register: donor_maintenance
 
+            - name: Verify the selected donor is in maintenance with no connections
+              ansible.builtin.command:
+                argv: [maxctrl, api, get, 'servers/{{ seed_source }}']
+              delegate_to: maxscale
+              register: isolated_donor
+              changed_when: false
+              until:
+                - "'maintenance' in ((isolated_donor.stdout | from_json).data.attributes.state | lower)"
+                - (isolated_donor.stdout | from_json).data.attributes.statistics.connections | int == 0
+              retries: 30
+              delay: 2
+
             - name: Snapshot stopped MariaDB then restart the donor
               ansible.builtin.script:
                 cmd: '../scripts/create_zfs_seed.py snapshot'
@@ -242,53 +261,128 @@
               delegate_to: maxscale
               when: donor_drained is defined and donor_drained is succeeded and recovered_donor is defined and recovered_donor is succeeded
 
-        - name: Snapshot the primary only with explicit fallback permission
-          ansible.builtin.script:
-            cmd: '../scripts/create_zfs_seed.py snapshot --primary'
-            executable: /usr/bin/python3
-          register: primary_zfs_seed
-          when: seed_method == 'zfs' and seed_source == 'primary'
-
-        - name: Record primary ZFS snapshot coordinates
-          ansible.builtin.set_fact:
-            seed_manifest: '{{ primary_zfs_seed.stdout | from_json }}'
-          when: seed_method == 'zfs' and seed_source == 'primary'
-
-        - name: Use an explicitly permitted primary cold seed
-          when: seed_method == 'cold'
+        - name: Isolate the approved primary donor during its seed snapshot or copy
+          when: seed_source == 'primary'
           block:
-            - name: Explain primary downtime
-              ansible.builtin.debug:
-                msg: 'PRIMARY FALLBACK: primary writes pause during the clean copy; no eligible replica donor exists.'
-
-            - name: Ensure rsync exists on the primary
-              ansible.builtin.apt:
-                name: rsync
-                state: present
-
-            - name: Create the primary copy workspace
-              ansible.builtin.file:
-                path: /data/backup_source/.jenkins-seed-current
-                state: directory
-                mode: '0700'
-
-            - name: Make a consistent cold copy and restart primary
-              ansible.builtin.script:
-                cmd: ../scripts/create_cold_seed.py
-                executable: /usr/bin/python3
-              register: cold_seed
-
-            - name: Record primary seed coordinates
-              ansible.builtin.set_fact:
-                seed_manifest:
-                  gtid: '{{ (cold_seed.stdout | from_json).gtid }}'
-                  version: '{{ primary_seed_version.stdout }}'
-                  method: cold
-                  redo_subdir: ''
-
-            - name: Package the cold copy
+            - name: Check primary administrative state
               ansible.builtin.command:
-                argv: [tar, -czf, /data/backup_source/.jenkins-seed-current/seed.tar.gz, -C, /data/backup_source/.jenkins-seed-current, backup]
+                argv: [maxctrl, api, get, servers/primary]
+              delegate_to: maxscale
+              register: primary_admin_state
+              changed_when: false
+
+            - name: Refuse to override existing primary isolation
+              ansible.builtin.assert:
+                that:
+                  - "'maintenance' not in ((primary_admin_state.stdout | from_json).data.attributes.state | lower)"
+                  - "'drain' not in ((primary_admin_state.stdout | from_json).data.attributes.state | lower)"
+
+            - name: Drain the approved primary donor
+              ansible.builtin.command:
+                argv: [maxctrl, set, server, primary, drain]
+              delegate_to: maxscale
+              register: primary_drained
+
+            - name: Wait for primary donor connections to drain
+              ansible.builtin.command:
+                argv: [maxctrl, api, get, servers/primary]
+              delegate_to: maxscale
+              register: primary_drain_state
+              changed_when: false
+              until: (primary_drain_state.stdout | from_json).data.attributes.statistics.connections | int == 0
+              retries: 60
+              delay: 2
+
+            - name: Put the approved primary donor in maintenance
+              ansible.builtin.command:
+                argv: [maxctrl, set, server, primary, maintenance]
+              delegate_to: maxscale
+              register: primary_maintenance
+
+            - name: Verify primary donor maintenance before stopping MariaDB
+              ansible.builtin.command:
+                argv: [maxctrl, api, get, servers/primary]
+              delegate_to: maxscale
+              register: primary_isolation
+              changed_when: false
+              until:
+                - "'maintenance' in ((primary_isolation.stdout | from_json).data.attributes.state | lower)"
+                - (primary_isolation.stdout | from_json).data.attributes.statistics.connections | int == 0
+              retries: 30
+              delay: 2
+
+            - name: Snapshot the primary only with explicit fallback permission
+              ansible.builtin.script:
+                cmd: '../scripts/create_zfs_seed.py snapshot --primary'
+                executable: /usr/bin/python3
+              register: primary_zfs_seed
+              when: seed_method == 'zfs' and seed_source == 'primary'
+
+            - name: Record primary ZFS snapshot coordinates
+              ansible.builtin.set_fact:
+                seed_manifest: '{{ primary_zfs_seed.stdout | from_json }}'
+              when: seed_method == 'zfs' and seed_source == 'primary'
+
+            - name: Use an explicitly permitted primary cold seed
+              when: seed_method == 'cold'
+              block:
+                - name: Explain primary downtime
+                  ansible.builtin.debug:
+                    msg: 'PRIMARY FALLBACK: primary writes pause during the clean copy; no eligible replica donor exists.'
+
+                - name: Ensure rsync exists on the primary
+                  ansible.builtin.apt:
+                    name: rsync
+                    state: present
+
+                - name: Create the primary copy workspace
+                  ansible.builtin.file:
+                    path: /data/backup_source/.jenkins-seed-current
+                    state: directory
+                    mode: '0700'
+
+                - name: Make a consistent cold copy and restart primary
+                  ansible.builtin.script:
+                    cmd: ../scripts/create_cold_seed.py
+                    executable: /usr/bin/python3
+                  register: cold_seed
+
+                - name: Record primary seed coordinates
+                  ansible.builtin.set_fact:
+                    seed_manifest:
+                      gtid: '{{ (cold_seed.stdout | from_json).gtid }}'
+                      version: '{{ primary_seed_version.stdout }}'
+                      method: cold
+                      redo_subdir: ''
+
+                - name: Package the cold copy
+                  ansible.builtin.command:
+                    argv: [tar, -czf, /data/backup_source/.jenkins-seed-current/seed.tar.gz, -C, /data/backup_source/.jenkins-seed-current, backup]
+
+          always:
+            - name: Require writable primary recovery before restoring proxy traffic
+              community.mysql.mysql_query:
+                login_unix_socket: /run/mysqld/mysqld.sock
+                query: SELECT @@read_only AS read_only
+              register: primary_recovered
+              until:
+                - primary_recovered is succeeded
+                - primary_recovered.query_result[0][0].read_only | int == 0
+              retries: 30
+              delay: 2
+              when: primary_drained is defined and primary_drained is succeeded
+
+            - name: Clear only primary maintenance set by this run
+              ansible.builtin.command:
+                argv: [maxctrl, clear, server, primary, maintenance]
+              delegate_to: maxscale
+              when: primary_maintenance is defined and primary_maintenance is succeeded and primary_recovered is defined and primary_recovered is succeeded
+
+            - name: Clear only primary drain set by this run
+              ansible.builtin.command:
+                argv: [maxctrl, clear, server, primary, drain]
+              delegate_to: maxscale
+              when: primary_drained is defined and primary_drained is succeeded and primary_recovered is defined and primary_recovered is succeeded
 
         - name: Generate the ZFS stream after donor recovery and traffic restoration
           ansible.builtin.script:

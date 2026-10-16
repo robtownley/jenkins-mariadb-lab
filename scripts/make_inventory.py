@@ -8,12 +8,19 @@ if "primary" not in nodes or "maxscale" not in nodes:
     raise SystemExit("Terraform output must include primary and maxscale.")
 
 unexpected = [name for name in nodes if name not in ("primary", "maxscale", "monitor", "ssm")
-              and not re.fullmatch(r"replica[1-9][0-9]*", name)]
+              and not re.fullmatch(r"(?:replica|sdds|affiliate-feed|heron)[1-9][0-9]*", name)]
 if unexpected:
     raise SystemExit(f"Unexpected node names: {unexpected}")
 
 replicas = sorted((name for name in nodes if name.startswith("replica")),
                   key=lambda name: int(name[7:]))
+downstream = sorted((name for name in nodes if re.fullmatch(r'(sdds|affiliate-feed|heron)[1-9][0-9]*', name)),
+                    key=lambda name: (int(re.search(r'[0-9]+$', name)[0]), name))
+for name in downstream:
+    parent = 'replica' + re.search(r'[0-9]+$', name)[0]
+    if parent not in replicas:
+        raise SystemExit(f'{name} requires upstream {parent}')
+all_replicas = replicas + downstream
 hosts = {}
 for role, node in nodes.items():
     hosts[role] = {
@@ -26,6 +33,13 @@ for role, node in nodes.items():
         hosts[role]["mariadb_server_id"] = 1
     elif role in replicas:
         hosts[role]["mariadb_server_id"] = int(role[7:]) + 1
+        hosts[role]['replication_upstream'] = 'primary'
+        hosts[role]['database_tier'] = 2
+    elif role in downstream:
+        family, number = re.fullmatch(r'(sdds|affiliate-feed|heron)([1-9][0-9]*)', role).groups()
+        hosts[role]['mariadb_server_id'] = {'sdds': 1000, 'affiliate-feed': 2000, 'heron': 3000}[family] + int(number)
+        hosts[role]['replication_upstream'] = 'replica' + number
+        hosts[role]['database_tier'] = 3
 
 inventory = {
     "all": {
@@ -41,7 +55,10 @@ inventory = {
         "children": {
             "database": {"children": {
                 "primary_node": {"hosts": {"primary": hosts["primary"]}},
-                "replicas": {"hosts": {name: hosts[name] for name in replicas}},
+                "replicas": {"children": {
+                    "intermediate_replicas": {"hosts": {name: hosts[name] for name in replicas}},
+                    "downstream_replicas": {"hosts": {name: hosts[name] for name in downstream}},
+                }},
             }},
             "proxy": {"hosts": {"maxscale": hosts["maxscale"]}},
             "ssm_monitoring": {"hosts": {"ssm": hosts["ssm"]} if "ssm" in hosts else {}},
@@ -50,6 +67,6 @@ inventory = {
     }
 }
 Path("inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
-Path("replicas.txt").write_text("".join(name + "\n" for name in replicas))
-Path("database-order.txt").write_text("".join(name + "\n" for name in replicas + ["primary"]))
-print("Inventory generated for:", ", ".join(["primary"] + replicas + ["maxscale"]))
+Path("replicas.txt").write_text("".join(name + "\n" for name in all_replicas))
+Path("database-order.txt").write_text("".join(name + "\n" for name in list(reversed(downstream)) + replicas + ["primary"]))
+print("Inventory generated for:", ", ".join(nodes))

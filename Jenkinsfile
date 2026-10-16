@@ -12,7 +12,7 @@ pipeline {
         choice(name: 'ACTION', choices: ['PLAN', 'APPLY', 'DESTROY'],
                description: 'Preview, provision, or remove the database lab')
         choice(name: 'REPLICA_COUNT', choices: ['2', '1', '3', '4', '5', '6'],
-               description: 'Desired replicas. Reducing this destroys the highest numbered replicas and their data disks. Select the CURRENT count for DESTROY.')
+               description: 'Intermediate replicas; each adds sddsN, affiliate-feedN and heronN. Reducing destroys that entire branch and its disks. Select the CURRENT count for DESTROY.')
     }
 
     environment {
@@ -89,7 +89,7 @@ pipeline {
             steps {
                 timeout(time: 30, unit: 'MINUTES') {
                     input(
-                        message: "Review plan.txt and change-summary.txt. Execute ${params.ACTION} with ${params.REPLICA_COUNT ?: '2'} replicas? Removed replicas lose their disks and local snapshots. APPLY seeds from a healthy ZFS replica first. Primary seeding requires a separate approval if no suitable replica exists. Primary storage migrations can pause writes.",
+                        message: "Review plan.txt and change-summary.txt. Execute ${params.ACTION} with ${params.REPLICA_COUNT ?: '2'} replicas? Removed replicas lose their disks and local snapshots. APPLY seeds from a healthy ZFS replica first. Every seed donor requires a separate explicit approval. Primary storage migrations can pause writes.",
                         ok: 'Execute approved plan', submitter: 'rob'
                     )
                 }
@@ -193,7 +193,7 @@ if needs_seed:
         raise SystemExit('Invalid seed source')
     if method not in ('zfs', 'cold') or not isinstance(targets, list) or not targets:
         raise SystemExit('Invalid seed method or targets')
-    if any(not isinstance(node, str) or not re.fullmatch(r'replica[1-9][0-9]*', node) for node in targets):
+    if any(not isinstance(node, str) or not re.fullmatch(r'(?:replica|sdds|affiliate-feed|heron)[1-9][0-9]*', node) for node in targets):
         raise SystemExit('Invalid seed target')
 else:
     source, method, targets = '-', '-', []
@@ -220,12 +220,19 @@ PYSEED
                                 )
                             }
                             primarySeedApproved = true
+                        } else if (seedDecision.needs_seed) {
+                            timeout(time: 30, unit: 'MINUTES') {
+                                input(
+                                    message: "Approve ${seedDecision.source} as seed donor for ${seedDecision.targets.join(', ')}? This exact donor will be drained and placed into MaxScale maintenance before MariaDB is stopped for the ZFS snapshot.",
+                                    ok: 'Approve selected donor', submitter: 'rob'
+                                )
+                            }
                         } else {
-                            echo(seedDecision.needs_seed
-                                ? "Replica donor selected: ${seedDecision.source}; primary approval is unnecessary."
-                                : 'No fresh replicas require seeding.')
+                            echo 'No fresh replicas require seeding.'
                         }
-                        withEnv(["ALLOW_PRIMARY_SEED=${primarySeedApproved}", 'SEED_PLAN_ONLY=false']) {
+                        withEnv(["ALLOW_PRIMARY_SEED=${primarySeedApproved}", 'SEED_PLAN_ONLY=false',
+                                 "APPROVED_SEED_SOURCE=${seedDecision.source}",
+                                 "APPROVED_SEED_TARGETS=${seedDecision.targets.join(',')}"]) {
                             sh '''
                                 set +x
                                 set -eu
@@ -350,7 +357,7 @@ PYSEED
             sh 'python3 scripts/build_summary.py --result FAILURE'
             archiveArtifacts artifacts: 'lab-summary.txt', allowEmptyArchive: true
         }
-        always {
+        cleanup {
             sh 'rm -f terraform/tfplan terraform/tfplan.json .seed-transfer/seed.tar.gz .seed-transfer/seed.zfs seed-plan.json'
         }
     }

@@ -18,6 +18,7 @@
           until:
             - replication_health is succeeded
             - (replication_health.query_result | default([[]], true))[0] | length == 1
+            - channel.Master_Host | default('') == hostvars[replication_upstream].ansible_host
             - channel.Slave_IO_Running | default('') == 'Yes'
             - channel.Slave_SQL_Running | default('') == 'Yes'
             - channel.Seconds_Behind_Master | default(none) != none

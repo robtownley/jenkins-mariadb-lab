@@ -137,11 +137,7 @@
         owner: root
         group: maxscale
         mode: "0640"
-      notify: Restart MaxScale
       no_log: true
-
-    - name: Apply configuration changes
-      ansible.builtin.meta: flush_handlers
 
     - name: Enable and start MaxScale
       ansible.builtin.systemd_service:
@@ -155,11 +151,33 @@
         port: 3306
         timeout: 60
 
-  handlers:
-    - name: Restart MaxScale
-      ansible.builtin.systemd_service:
-        name: maxscale
-        state: restarted
+    - name: Install MaxScale membership reconciler
+      ansible.builtin.copy:
+        src: files/reconcile_maxscale.py
+        dest: /usr/local/sbin/reconcile-lab-maxscale
+        mode: '0700'
+
+    - name: Write direct-tier backend membership
+      ansible.builtin.copy:
+        dest: /etc/maxscale-lab-members.json
+        mode: '0600'
+        content: >-
+          {{ dict((['primary'] + groups['intermediate_replicas']) | zip((['primary'] + groups['intermediate_replicas']) | map('extract', hostvars, 'ansible_host'))) | to_json }}
+
+    - name: Reconcile runtime monitoring credentials
+      ansible.builtin.command:
+        argv: [maxctrl, alter, monitor, MariaDB-Monitor, user, lab_monitor, password, '{{ lab_monitor_password }}']
+      no_log: true
+
+    - name: Reconcile runtime service credentials
+      ansible.builtin.command:
+        argv: [maxctrl, alter, service, ReadWrite-Service, user, lab_service, password, '{{ lab_service_password }}']
+      no_log: true
+
+    - name: Reconcile monitoring membership without restarting MaxScale
+      ansible.builtin.command: /usr/bin/python3 /usr/local/sbin/reconcile-lab-maxscale --phase monitor
+      register: maxscale_members
+      changed_when: "maxscale_members.stdout | trim == 'CHANGED'"
 
 - name: Identify fresh replicas that need a backup seed
   tags: [seed_plan]
@@ -180,10 +198,10 @@
           - existing_replication.query_result[0] | length <= 1
         fail_msg: "Multi-source channels are outside this lab's seed procedure."
 
-    - name: Confirm an existing channel points to our primary
+    - name: Confirm an existing channel points to its assigned upstream
       ansible.builtin.assert:
         that:
-          - existing_replication.query_result[0][0].Master_Host == hostvars['primary'].ansible_host
+          - existing_replication.query_result[0][0].Master_Host == hostvars[replication_upstream].ansible_host
         fail_msg: "Replica points elsewhere; refusing automatic reconfiguration."
       when: existing_replication.query_result[0] | length > 0
 
@@ -214,8 +232,28 @@
 
 - import_playbook: seed_replicas.yml
 
+- name: Grant child replication access locally on intermediate replicas
+  hosts: intermediate_replicas
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    - name: Ensure each child can connect without creating local GTIDs
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - SET SESSION sql_log_bin = 0
+          - "CREATE USER IF NOT EXISTS 'lab_repl'@'{{ hostvars[item].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "ALTER USER 'lab_repl'@'{{ hostvars[item].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "GRANT REPLICATION SLAVE ON *.* TO 'lab_repl'@'{{ hostvars[item].ansible_host }}'"
+      loop: "{{ groups['downstream_replicas'] }}"
+      when: hostvars[item].replication_upstream == inventory_hostname
+      no_log: true
+
 - name: Establish and verify current replica connections
-  hosts: replicas
+  hosts: intermediate_replicas:downstream_replicas
+  order: inventory
   become: true
   serial: 1
   any_errors_fatal: true
@@ -228,11 +266,55 @@
         query: SHOW SLAVE STATUS
       register: channel
 
+    - name: Write a post-seed GTID anchor on the primary
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: INSERT INTO lab.pipeline_checks (marker) VALUES (CONCAT('tier3-anchor-', UUID()))
+      delegate_to: primary
+      when: inventory_hostname in groups['downstream_replicas'] and channel.query_result[0] | length == 0
+
+    - name: Read the primary position for downstream catchup
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT @@global.gtid_binlog_pos AS position
+      delegate_to: primary
+      register: downstream_anchor
+      when: inventory_hostname in groups['downstream_replicas'] and channel.query_result[0] | length == 0
+
+    - name: Wait until the intermediate has logged the post-seed anchor
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT MASTER_GTID_WAIT(%s, 120) AS wait_result
+        positional_args:
+          - "{{ downstream_anchor.query_result[0][0].position }}"
+      delegate_to: "{{ replication_upstream }}"
+      register: upstream_anchor_wait
+      failed_when: upstream_anchor_wait.query_result[0][0].wait_result | int < 0
+      when: inventory_hostname in groups['downstream_replicas'] and channel.query_result[0] | length == 0
+
+    - name: Read applied seed GTID for a downstream replica
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT @@global.gtid_slave_pos AS position
+      register: child_seed_position
+      when: inventory_hostname in groups['downstream_replicas']
+
+    - name: Wait for the assigned upstream to contain the downstream seed position
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT MASTER_GTID_WAIT(%s, 120) AS wait_result
+        positional_args:
+          - "{{ child_seed_position.query_result[0][0].position }}"
+      delegate_to: "{{ replication_upstream }}"
+      register: upstream_seed_wait
+      failed_when: upstream_seed_wait.query_result[0][0].wait_result | int < 0
+      when: inventory_hostname in groups['downstream_replicas']
+
     - name: Configure a seeded replica using its backup GTID position
       community.mysql.mysql_replication:
         login_unix_socket: /run/mysqld/mysqld.sock
         mode: changeprimary
-        primary_host: "{{ hostvars['primary'].ansible_host }}"
+        primary_host: "{{ hostvars[replication_upstream].ansible_host }}"
         primary_user: lab_repl
         primary_password: "{{ lab_repl_password }}"
         primary_port: 3306
@@ -270,6 +352,11 @@
   vars_files:
     - secrets.yml
   tasks:
+    - name: Link healthy direct-tier replicas to the application service
+      ansible.builtin.command: /usr/bin/python3 /usr/local/sbin/reconcile-lab-maxscale --phase route
+      register: maxscale_routing
+      changed_when: "maxscale_routing.stdout | trim == 'CHANGED'"
+
     - name: Insert this build's marker through MaxScale
       community.mysql.mysql_query:
         login_host: 127.0.0.1

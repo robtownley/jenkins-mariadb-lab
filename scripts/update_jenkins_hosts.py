@@ -33,6 +33,9 @@ def entries(nodes):
         elif re.fullmatch(r'replica[1-9][0-9]?', role):
             number = int(role[7:])
             alias, order = f'mariadb-replica-{number}', (1, number)
+        elif re.fullmatch(r'(sdds|affiliate-feed|heron)[1-9][0-9]?', role):
+            number = int(re.search(r'[0-9]+$', role)[0])
+            alias, order = f'mariadb-{role}', (1, 1000 + number * 10 + {'sdds': 1, 'affiliate-feed': 2, 'heron': 3}[re.sub(r'[0-9]+$', '', role)])
         else:
             raise ValueError(f'Unexpected lab role: {role!r}')
         if not isinstance(node, dict):

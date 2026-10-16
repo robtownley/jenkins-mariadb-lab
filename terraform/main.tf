@@ -1,5 +1,5 @@
 variable "replica_count" {
-  description = "Desired number of MariaDB replicas"
+  description = "Number of intermediate replicas, each with sdds, affiliate-feed and heron children"
   type        = number
   default     = 2
   validation {
@@ -16,7 +16,12 @@ locals {
   replicas = {
     for n in range(1, var.replica_count + 1) : "replica${n}" => "mariadb-replica-${n}"
   }
-  database_nodes = merge({ primary = "mariadb-primary" }, local.replicas)
+  downstream_replicas = merge([
+    for n in range(1, var.replica_count + 1) : {
+      for family in ["sdds", "affiliate-feed", "heron"] : "${family}${n}" => "mariadb-${family}${n}"
+    }
+  ]...)
+  database_nodes = merge({ primary = "mariadb-primary" }, local.replicas, local.downstream_replicas)
   nodes          = merge(local.database_nodes, { maxscale = "mariadb-maxscale" })
 
   mysql_zfs_disks = merge([

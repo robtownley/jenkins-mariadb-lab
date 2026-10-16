@@ -29,6 +29,10 @@ if success and action=='APPLY':
     nodes_path=Path('nodes.json')
     if nodes_path.exists():
         nodes=json.loads(nodes_path.read_text())
+        import re
+        direct = [name for name in nodes if re.fullmatch(r'replica[1-9][0-9]*', name)]
+        children = [name for name in nodes if re.fullmatch(r'(sdds|affiliate-feed|heron)[1-9][0-9]*', name)]
+        lines.append(f'Database topology: 1 primary, {len(direct)} intermediate replicas, {len(children)} downstream replicas.')
         lines.append(f'Active instances: {len(nodes)}')
         for name,n in nodes.items():lines.append(f'  {name}: {n["instance_id"]}; private={n["private_ip"]}; public={n.get("public_ip", "")}')
     lines.extend(['','Configuration stages completed (some tasks may already have been correct):','  Jenkins hosts, instance hostnames and SSH hopping','  MariaDB/MaxScale installation, topology configuration and verification','  Seed planning; data seeding only where required and approved','  ZFS mirrors, datadir/log/temp/redo path migration checks','  Replica replication verification','  Sanoid: 24 hourly and 1 daily snapshots per replica','  Monitoring inventory and health endpoints','  HTTPS dashboard, password authentication and certificate renewal','  Shattered Silicon Monitoring server and OS/MySQL metrics on database nodes'])

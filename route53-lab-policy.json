@@ -1,0 +1,80 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "FindPublicLabZone",
+      "Effect": "Allow",
+      "Action": [
+        "route53:ListHostedZones",
+        "route53:ListHostedZonesByName"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InspectLabDNS",
+      "Effect": "Allow",
+      "Action": [
+        "route53:GetHostedZone",
+        "route53:ListResourceRecordSets",
+        "route53:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:route53:::hostedzone/*"
+    },
+    {
+      "Sid": "WaitForDNSChanges",
+      "Effect": "Allow",
+      "Action": "route53:GetChange",
+      "Resource": "arn:aws:route53:::change/*"
+    },
+    {
+      "Sid": "ManageNamedLabARecords",
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/*",
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+            "primary.roblabb.com",
+            "maxscale.roblabb.com",
+            "monitor.roblabb.com",
+            "dashboard.roblabb.com",
+            "jenkins.roblabb.com",
+            "ssm.roblabb.com",
+            "replica1.roblabb.com",
+            "sdds1.roblabb.com",
+            "affiliate-feed1.roblabb.com",
+            "heron1.roblabb.com",
+            "replica2.roblabb.com",
+            "sdds2.roblabb.com",
+            "affiliate-feed2.roblabb.com",
+            "heron2.roblabb.com",
+            "replica3.roblabb.com",
+            "sdds3.roblabb.com",
+            "affiliate-feed3.roblabb.com",
+            "heron3.roblabb.com",
+            "replica4.roblabb.com",
+            "sdds4.roblabb.com",
+            "affiliate-feed4.roblabb.com",
+            "heron4.roblabb.com",
+            "replica5.roblabb.com",
+            "sdds5.roblabb.com",
+            "affiliate-feed5.roblabb.com",
+            "heron5.roblabb.com",
+            "replica6.roblabb.com",
+            "sdds6.roblabb.com",
+            "affiliate-feed6.roblabb.com",
+            "heron6.roblabb.com"
+          ],
+          "route53:ChangeResourceRecordSetsRecordTypes": [
+            "A"
+          ],
+          "route53:ChangeResourceRecordSetsActions": [
+            "CREATE",
+            "UPSERT",
+            "DELETE"
+          ]
+        }
+      }
+    }
+  ]
+}

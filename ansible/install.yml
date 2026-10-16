@@ -119,13 +119,8 @@
     - name: Install MaxScale with its dependencies
       ansible.builtin.apt:
         deb: /var/tmp/maxscale_24.02.6_noble_amd64.deb
+        policy_rc_d: 101
         lock_timeout: 300
-
-    - name: Keep MaxScale stopped until its configuration is ready
-      ansible.builtin.systemd_service:
-        name: maxscale
-        state: stopped
-        enabled: false
 
     - name: Read MaxScale version
       ansible.builtin.command: maxscale --version

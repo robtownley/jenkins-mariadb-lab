@@ -67,7 +67,7 @@
         content: |
           [
           {% for node in groups['database'] + groups['proxy'] %}
-          {{ {'name': node, 'role': hostvars[node].lab_role, 'ip': hostvars[node].ansible_host} | to_json }}{{ ',' if not loop.last else '' }}
+          {{ {'name': node, 'role': hostvars[node].lab_role, 'ip': hostvars[node].ansible_host, 'upstream': (hostvars[node].replication_upstream | default(''))} | to_json }}{{ ',' if not loop.last else '' }}
           {% endfor %}
           ]
       notify: Restart dashboard
