@@ -1,0 +1,205 @@
+---
+- name: Determine whether the downstream needs bootstrap or seed-gap recovery
+  ansible.builtin.set_fact:
+    child_channel: "{{ (channel.query_result[0] | first) | default({}) }}"
+
+- name: Require one expected single-source channel at most
+  ansible.builtin.assert:
+    that:
+      - channel.query_result[0] | length <= 1
+      - child_channel.Master_Host | default(hostvars['primary'].ansible_host) in [hostvars['primary'].ansible_host, hostvars[replication_upstream].ansible_host]
+    fail_msg: 'Unexpected replication topology; refusing to change the channel.'
+
+- name: Identify new, interrupted-primary, or missing-binlog-GTID bootstrap
+  ansible.builtin.set_fact:
+    child_needs_bootstrap: >-
+      {{ channel.query_result[0] | length == 0
+         or child_channel.Master_Host | default('') == hostvars['primary'].ansible_host
+         or (child_channel.Last_IO_Errno | default(0) | int == 1236
+             and 'missing the GTID' in (child_channel.Last_IO_Error | default(''))) }}
+
+- name: Catch up on the primary before moving to the assigned intermediate
+  when: child_needs_bootstrap | bool
+  block:
+    - name: Read downstream identity and applied state
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: >-
+          SELECT @@server_id AS server_id, @@read_only AS read_only,
+          @@global.gtid_slave_pos AS applied, @@global.gtid_current_pos AS current_pos,
+          @@global.gtid_strict_mode AS strict_mode
+      register: child_identity
+
+    - name: Require a read-only lab replica with no local GTIDs or SQL errors
+      ansible.builtin.assert:
+        that:
+          - child_identity.query_result[0][0].server_id | int == mariadb_server_id | int
+          - child_identity.query_result[0][0].read_only | int == 1
+          - child_identity.query_result[0][0].strict_mode | int == 1
+          - child_identity.query_result[0][0].applied is match('^0-1-[0-9]+$')
+          - child_identity.query_result[0][0].applied == child_identity.query_result[0][0].current_pos
+          - child_channel.Last_SQL_Errno | default(0) | int == 0
+          - child_channel.Using_Gtid | default('Slave_Pos') == 'Slave_Pos'
+          - child_channel.Replicate_Do_DB | default('') == ''
+          - child_channel.Replicate_Ignore_DB | default('') == ''
+          - child_channel.Replicate_Do_Table | default('') == ''
+          - child_channel.Replicate_Ignore_Table | default('') == ''
+          - child_channel.Replicate_Wild_Do_Table | default('') == ''
+          - child_channel.Replicate_Wild_Ignore_Table | default('') == ''
+          - child_channel.Replicate_Rewrite_DB | default('') == ''
+          - child_channel.Replicate_Do_Domain_Ids | default('') == ''
+          - child_channel.Replicate_Ignore_Domain_Ids | default('') == ''
+          - child_channel.Replicate_Ignore_Server_Ids | default('') == ''
+        fail_msg: 'This bootstrap fix supports only the unfiltered, domain-0 lab. Local GTIDs, SQL errors or unexpected identity need inspection.'
+
+    - name: Explain the temporary catchup route
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: temporary primary catchup, then {{ replication_upstream }}. Applied GTIDs are preserved; no transactions are skipped."
+
+    - name: Stop the existing downstream channel before changing its source
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: stopreplica
+      when: channel.query_result[0] | length > 0
+
+    - name: Configure temporary primary replication using the preserved applied GTID
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: changeprimary
+        primary_host: "{{ hostvars['primary'].ansible_host }}"
+        primary_user: lab_repl
+        primary_password: "{{ lab_repl_password }}"
+        primary_port: 3306
+        primary_use_gtid: replica_pos
+      no_log: true
+
+    - name: Start temporary primary replication
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: startreplica
+
+    - name: Write a real post-seed transaction that both replicas must apply
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: INSERT INTO lab.pipeline_checks (marker) VALUES (CONCAT('tier3-catchup-', UUID()))
+      delegate_to: primary
+
+    - name: Read the primary catchup target
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT @@global.gtid_binlog_pos AS position
+      delegate_to: primary
+      register: catchup_target
+
+    - name: Require healthy temporary primary replication
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW SLAVE STATUS
+      register: primary_channel
+      until:
+        - primary_channel.query_result[0] | length == 1
+        - primary_channel.query_result[0][0].Slave_IO_Running == 'Yes'
+        - primary_channel.query_result[0][0].Slave_SQL_Running == 'Yes'
+      failed_when: >-
+        primary_channel.query_result[0] | length != 1
+        or primary_channel.query_result[0][0].Last_IO_Errno | int != 0
+        or primary_channel.query_result[0][0].Last_SQL_Errno | int != 0
+      retries: 30
+      delay: 2
+
+    - name: Apply the primary target on the downstream
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT MASTER_GTID_WAIT(%s, 120) AS wait_result
+        positional_args:
+          - "{{ catchup_target.query_result[0][0].position }}"
+      register: downstream_catchup
+      failed_when: downstream_catchup.query_result[0][0].wait_result | int < 0
+
+    - name: Freeze the downstream at a genuinely applied post-seed position
+      community.mysql.mysql_replication:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        mode: stopreplica
+
+    - name: Verify and switch the frozen downstream to its assigned intermediate
+      block:
+        - name: Read the frozen applied position
+          community.mysql.mysql_query:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            query: SELECT @@global.gtid_slave_pos AS position
+          register: frozen_child
+
+        - name: Read the assigned intermediate replication channel
+          community.mysql.mysql_query:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            query: SHOW SLAVE STATUS
+          delegate_to: "{{ replication_upstream }}"
+          register: intermediate_channel
+
+        - name: Require a healthy unfiltered intermediate following this primary
+          ansible.builtin.assert:
+            that:
+              - intermediate_channel.query_result[0] | length == 1
+              - intermediate_channel.query_result[0][0].Master_Host == hostvars['primary'].ansible_host
+              - intermediate_channel.query_result[0][0].Slave_IO_Running == 'Yes'
+              - intermediate_channel.query_result[0][0].Slave_SQL_Running == 'Yes'
+              - intermediate_channel.query_result[0][0].Last_IO_Errno | int == 0
+              - intermediate_channel.query_result[0][0].Last_SQL_Errno | int == 0
+              - intermediate_channel.query_result[0][0].Replicate_Do_DB | default('') == ''
+              - intermediate_channel.query_result[0][0].Replicate_Ignore_DB | default('') == ''
+              - intermediate_channel.query_result[0][0].Replicate_Do_Table | default('') == ''
+              - intermediate_channel.query_result[0][0].Replicate_Ignore_Table | default('') == ''
+              - intermediate_channel.query_result[0][0].Replicate_Wild_Do_Table | default('') == ''
+              - intermediate_channel.query_result[0][0].Replicate_Wild_Ignore_Table | default('') == ''
+              - intermediate_channel.query_result[0][0].Replicate_Rewrite_DB | default('') == ''
+              - intermediate_channel.query_result[0][0].Replicate_Do_Domain_Ids | default('') == ''
+              - intermediate_channel.query_result[0][0].Replicate_Ignore_Domain_Ids | default('') == ''
+              - intermediate_channel.query_result[0][0].Replicate_Ignore_Server_Ids | default('') == ''
+            fail_msg: 'Intermediate is not a healthy, unfiltered single-source lab replica; refusing the switch.'
+
+        - name: Require binary logging of replicated updates on the assigned intermediate
+          community.mysql.mysql_query:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            query: SELECT @@log_bin AS logging, @@log_slave_updates AS forwarding
+          delegate_to: "{{ replication_upstream }}"
+          register: intermediate_logging
+
+        - name: Validate intermediate forwarding settings
+          ansible.builtin.assert:
+            that:
+              - intermediate_logging.query_result[0][0].logging | int == 1
+              - intermediate_logging.query_result[0][0].forwarding | int == 1
+
+        - name: Wait until the intermediate has applied the frozen downstream position
+          community.mysql.mysql_query:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            query: SELECT MASTER_GTID_WAIT(%s, 120) AS wait_result
+            positional_args:
+              - "{{ frozen_child.query_result[0][0].position }}"
+          delegate_to: "{{ replication_upstream }}"
+          register: intermediate_catchup
+          failed_when: intermediate_catchup.query_result[0][0].wait_result | int < 0
+
+        - name: Verify that exact GTID exists as an event in intermediate binlogs
+          ansible.builtin.script:
+            cmd: "../scripts/check_binlog_gtids.py {{ frozen_child.query_result[0][0].position }}"
+            executable: /usr/bin/python3
+          delegate_to: "{{ replication_upstream }}"
+          changed_when: false
+
+        - name: Switch to the assigned intermediate without modifying applied GTIDs
+          community.mysql.mysql_replication:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            mode: changeprimary
+            primary_host: "{{ hostvars[replication_upstream].ansible_host }}"
+            primary_user: lab_repl
+            primary_password: "{{ lab_repl_password }}"
+            primary_port: 3306
+            primary_use_gtid: replica_pos
+          no_log: true
+
+      always:
+        - name: Resume the configured channel after the switch or verification failure
+          community.mysql.mysql_replication:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            mode: startreplica
