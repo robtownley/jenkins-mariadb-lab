@@ -201,7 +201,10 @@
     - name: Confirm an existing channel points to its assigned upstream
       ansible.builtin.assert:
         that:
-          - existing_replication.query_result[0][0].Master_Host == hostvars[replication_upstream].ansible_host
+          - >-
+            existing_replication.query_result[0][0].Master_Host == hostvars[replication_upstream].ansible_host
+            or (inventory_hostname in groups['downstream_replicas'] and
+                existing_replication.query_result[0][0].Master_Host == hostvars['primary'].ansible_host)
         fail_msg: "Replica points elsewhere; refusing automatic reconfiguration."
       when: existing_replication.query_result[0] | length > 0
 
@@ -217,10 +220,36 @@
       register: existing_databases
       when: existing_replication.query_result[0] | length == 0
 
+    - name: Check for the preserved original datadir from this lab seeder
+      ansible.builtin.stat:
+        path: /var/lib/mysql-before-seed
+      register: preserved_seed_original
+      when: existing_replication.query_result[0] | length == 0
+
+    - name: Inspect GTID state on a restored but not yet configured seed
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: >-
+          SELECT @@global.gtid_slave_pos AS applied,
+          @@global.gtid_current_pos AS current_pos,
+          @@server_id AS server_id, @@read_only AS read_only
+      register: restored_seed_state
+      when: existing_replication.query_result[0] | length == 0
+
+    - name: Recognise a resumable lab seed without overwriting its data
+      ansible.builtin.set_fact:
+        resumable_lab_seed: >-
+          {{ preserved_seed_original.stat.isdir | default(false)
+             and restored_seed_state.query_result[0][0].applied is match('^0-1-[0-9]+$')
+             and restored_seed_state.query_result[0][0].applied == restored_seed_state.query_result[0][0].current_pos
+             and restored_seed_state.query_result[0][0].server_id | int == mariadb_server_id | int
+             and restored_seed_state.query_result[0][0].read_only | int == 1 }}
+      when: existing_replication.query_result[0] | length == 0
+
     - name: Only seed fresh replicas without application data
       ansible.builtin.assert:
         that:
-          - existing_databases.query_result[0][0].database_count | int == 0
+          - existing_databases.query_result[0][0].database_count | int == 0 or resumable_lab_seed | default(false) | bool
         fail_msg: "Unconfigured replica contains application data. Inspect it before reseeding."
       when: existing_replication.query_result[0] | length == 0
 
@@ -228,7 +257,14 @@
       ansible.builtin.add_host:
         name: "{{ inventory_hostname }}"
         groups: seed_targets
-      when: existing_replication.query_result[0] | length == 0
+      when:
+        - existing_replication.query_result[0] | length == 0
+        - not (resumable_lab_seed | default(false) | bool)
+
+    - name: Report reuse of an already restored seed
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: reusing restored seed; no new snapshot, overwrite or GTID reset."
+      when: resumable_lab_seed | default(false) | bool
 
 - import_playbook: seed_replicas.yml
 
@@ -266,48 +302,8 @@
         query: SHOW SLAVE STATUS
       register: channel
 
-    - name: Write a post-seed GTID anchor on the primary
-      community.mysql.mysql_query:
-        login_unix_socket: /run/mysqld/mysqld.sock
-        query: INSERT INTO lab.pipeline_checks (marker) VALUES (CONCAT('tier3-anchor-', UUID()))
-      delegate_to: primary
-      when: inventory_hostname in groups['downstream_replicas'] and channel.query_result[0] | length == 0
-
-    - name: Read the primary position for downstream catchup
-      community.mysql.mysql_query:
-        login_unix_socket: /run/mysqld/mysqld.sock
-        query: SELECT @@global.gtid_binlog_pos AS position
-      delegate_to: primary
-      register: downstream_anchor
-      when: inventory_hostname in groups['downstream_replicas'] and channel.query_result[0] | length == 0
-
-    - name: Wait until the intermediate has logged the post-seed anchor
-      community.mysql.mysql_query:
-        login_unix_socket: /run/mysqld/mysqld.sock
-        query: SELECT MASTER_GTID_WAIT(%s, 120) AS wait_result
-        positional_args:
-          - "{{ downstream_anchor.query_result[0][0].position }}"
-      delegate_to: "{{ replication_upstream }}"
-      register: upstream_anchor_wait
-      failed_when: upstream_anchor_wait.query_result[0][0].wait_result | int < 0
-      when: inventory_hostname in groups['downstream_replicas'] and channel.query_result[0] | length == 0
-
-    - name: Read applied seed GTID for a downstream replica
-      community.mysql.mysql_query:
-        login_unix_socket: /run/mysqld/mysqld.sock
-        query: SELECT @@global.gtid_slave_pos AS position
-      register: child_seed_position
-      when: inventory_hostname in groups['downstream_replicas']
-
-    - name: Wait for the assigned upstream to contain the downstream seed position
-      community.mysql.mysql_query:
-        login_unix_socket: /run/mysqld/mysqld.sock
-        query: SELECT MASTER_GTID_WAIT(%s, 120) AS wait_result
-        positional_args:
-          - "{{ child_seed_position.query_result[0][0].position }}"
-      delegate_to: "{{ replication_upstream }}"
-      register: upstream_seed_wait
-      failed_when: upstream_seed_wait.query_result[0][0].wait_result | int < 0
+    - name: Bootstrap or repair downstream starting positions without skipping GTIDs
+      ansible.builtin.include_tasks: connect_downstream.yml
       when: inventory_hostname in groups['downstream_replicas']
 
     - name: Configure a seeded replica using its backup GTID position
@@ -319,7 +315,7 @@
         primary_password: "{{ lab_repl_password }}"
         primary_port: 3306
         primary_use_gtid: replica_pos
-      when: channel.query_result[0] | length == 0
+      when: inventory_hostname in groups['intermediate_replicas'] and channel.query_result[0] | length == 0
       no_log: true
 
     - name: Start replication
@@ -334,6 +330,7 @@
       register: replication_status
       until:
         - replication_status.query_result[0] | length == 1
+        - replication_status.query_result[0][0].Master_Host == hostvars[replication_upstream].ansible_host
         - replication_status.query_result[0][0].Slave_IO_Running == 'Yes'
         - replication_status.query_result[0][0].Slave_SQL_Running == 'Yes'
         - replication_status.query_result[0][0].Seconds_Behind_Master is not none
