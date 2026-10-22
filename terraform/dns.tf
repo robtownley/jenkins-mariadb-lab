@@ -4,10 +4,6 @@ data "aws_route53_zone" "lab" {
   private_zone = false
 }
 
-data "aws_instance" "jenkins_dns" {
-  instance_id = "i-00f49e3237ca1fc0e"
-}
-
 locals {
   lab_dns_addresses = merge(
     { for role, node in aws_instance.node : role => node.public_ip },
@@ -15,7 +11,7 @@ locals {
       ssm       = aws_instance.ssm.public_ip
       monitor   = aws_instance.monitor.public_ip
       dashboard = aws_instance.monitor.public_ip
-      jenkins   = data.aws_instance.jenkins_dns.public_ip
+      jenkins   = var.home_jenkins_ipv4
     }
   )
 }

@@ -59,6 +59,19 @@ class TopologyTests(unittest.TestCase):
             self.assertIn('affiliate-feed1', rendered)
             self.assertEqual(rendered, host_helper.render(rendered, nodes))
 
+    def test_home_ssh_keeps_replication_addresses_private(self):
+        nodes, inv, _ = self.inventory(2)
+        def visit(group):
+            for name, host in group.get('hosts', {}).items():
+                self.assertEqual(host['ansible_host'], nodes[name]['private_ip'])
+                args = host['ansible_ssh_common_args']
+                self.assertIn('-o Hostname=' + nodes[name]['public_ip'], args)
+                self.assertIn('IdentitiesOnly=yes', args)
+                self.assertIn('UserKnownHostsFile=', args)
+            for child in group.get('children', {}).values():
+                visit(child)
+        visit(inv['all'])
+
     def test_missing_parent_rejected(self):
         self.inventory(2, omit='replica2')
 

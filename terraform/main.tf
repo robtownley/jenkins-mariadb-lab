@@ -71,6 +71,13 @@ resource "aws_security_group" "maxscale" {
   description = "MaxScale lab access"
   vpc_id      = local.vpc_id
   ingress {
+    description = "SSH from home Jenkins"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["${var.home_jenkins_ipv4}/32"]
+  }
+  ingress {
     description     = "SSH from Jenkins"
     from_port       = 22
     to_port         = 22
@@ -104,6 +111,13 @@ resource "aws_security_group" "database" {
   name        = "jenkins-mariadb-lab-database"
   description = "MariaDB replication and proxy access"
   vpc_id      = local.vpc_id
+  ingress {
+    description = "SSH from home Jenkins"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["${var.home_jenkins_ipv4}/32"]
+  }
   ingress {
     description     = "SSH from Jenkins"
     from_port       = 22
@@ -287,6 +301,13 @@ resource "aws_security_group" "monitor" {
   description = "Monitoring SSH access"
   vpc_id = local.vpc_id
   ingress {
+    description = "SSH from home Jenkins"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["${var.home_jenkins_ipv4}/32"]
+  }
+  ingress {
     from_port = 22
     to_port = 22
     protocol = "tcp"
@@ -342,6 +363,13 @@ resource "aws_security_group" "ssm" {
   name = "jenkins-mariadb-lab-ssm"
   description = "Shattered Silicon Monitoring"
   vpc_id = local.vpc_id
+  ingress {
+    description = "SSH from home Jenkins"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["${var.home_jenkins_ipv4}/32"]
+  }
   ingress {
     from_port = 22
     to_port = 22

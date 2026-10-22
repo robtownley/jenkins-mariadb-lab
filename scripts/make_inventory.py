@@ -1,4 +1,6 @@
 import json
+import ipaddress
+import shlex
 import os
 import re
 from pathlib import Path
@@ -21,6 +23,11 @@ for name in downstream:
     if parent not in replicas:
         raise SystemExit(f'{name} requires upstream {parent}')
 all_replicas = replicas + downstream
+# Keep private addresses for replication; only the SSH transport uses public IPs.
+ssh_common_args = (
+    "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+    f"-o UserKnownHostsFile={shlex.quote(str(Path.cwd() / 'lab-known-hosts'))}"
+)
 hosts = {}
 for role, node in nodes.items():
     hosts[role] = {
@@ -29,6 +36,15 @@ for role, node in nodes.items():
         "dashboard_public_ip": node.get("public_ip", ""),
         "zfs_volume_ids": node.get("zfs_volume_ids", []),
     }
+    try:
+        ssh_address = ipaddress.IPv4Address(node["public_ip"])
+        if ssh_address.is_unspecified or ssh_address.is_loopback or ssh_address.is_multicast:
+            raise ValueError("Invalid SSH destination")
+    except (KeyError, ValueError) as error:
+        raise SystemExit(f"{role} needs a valid public IPv4 address for home SSH") from error
+    hosts[role]["ansible_ssh_common_args"] = (
+        f"{ssh_common_args} -o Hostname={ssh_address}"
+    )
     if role == "primary":
         hosts[role]["mariadb_server_id"] = 1
     elif role in replicas:
