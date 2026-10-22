@@ -261,7 +261,7 @@
               delegate_to: maxscale
               when: donor_drained is defined and donor_drained is succeeded and recovered_donor is defined and recovered_donor is succeeded
 
-        - name: Isolate the approved primary donor during its seed snapshot or copy
+        - name: Create the approved primary seed with planned database downtime
           when: seed_source == 'primary'
           block:
             - name: Check primary administrative state
@@ -277,39 +277,13 @@
                   - "'maintenance' not in ((primary_admin_state.stdout | from_json).data.attributes.state | lower)"
                   - "'drain' not in ((primary_admin_state.stdout | from_json).data.attributes.state | lower)"
 
-            - name: Drain the approved primary donor
-              ansible.builtin.command:
-                argv: [maxctrl, set, server, primary, drain]
-              delegate_to: maxscale
-              register: primary_drained
-
-            - name: Wait for primary donor connections to drain
-              ansible.builtin.command:
-                argv: [maxctrl, api, get, servers/primary]
-              delegate_to: maxscale
-              register: primary_drain_state
-              changed_when: false
-              until: (primary_drain_state.stdout | from_json).data.attributes.statistics.connections | int == 0
-              retries: 60
-              delay: 2
-
-            - name: Put the approved primary donor in maintenance
-              ansible.builtin.command:
-                argv: [maxctrl, set, server, primary, maintenance]
-              delegate_to: maxscale
-              register: primary_maintenance
-
-            - name: Verify primary donor maintenance before stopping MariaDB
-              ansible.builtin.command:
-                argv: [maxctrl, api, get, servers/primary]
-              delegate_to: maxscale
-              register: primary_isolation
-              changed_when: false
-              until:
-                - "'maintenance' in ((primary_isolation.stdout | from_json).data.attributes.state | lower)"
-                - (primary_isolation.stdout | from_json).data.attributes.statistics.connections | int == 0
-              retries: 30
-              delay: 2
+            - name: Explain approved primary fallback downtime
+              ansible.builtin.debug:
+                msg: >-
+                  PRIMARY FALLBACK: MaxScale remains running. The active primary
+                  is not drained or put into maintenance. MariaDB is cleanly stopped
+                  for the approved snapshot or cold copy; writes and active database
+                  sessions can be interrupted until it restarts. No switchover is performed.
 
             - name: Snapshot the primary only with explicit fallback permission
               ansible.builtin.script:
@@ -360,7 +334,7 @@
                     argv: [tar, -czf, /data/backup_source/.jenkins-seed-current/seed.tar.gz, -C, /data/backup_source/.jenkins-seed-current, backup]
 
           always:
-            - name: Require writable primary recovery before restoring proxy traffic
+            - name: Require writable primary recovery after the approved seed
               community.mysql.mysql_query:
                 login_unix_socket: /run/mysqld/mysqld.sock
                 query: SELECT @@read_only AS read_only
@@ -370,19 +344,6 @@
                 - primary_recovered.query_result[0][0].read_only | int == 0
               retries: 30
               delay: 2
-              when: primary_drained is defined and primary_drained is succeeded
-
-            - name: Clear only primary maintenance set by this run
-              ansible.builtin.command:
-                argv: [maxctrl, clear, server, primary, maintenance]
-              delegate_to: maxscale
-              when: primary_maintenance is defined and primary_maintenance is succeeded and primary_recovered is defined and primary_recovered is succeeded
-
-            - name: Clear only primary drain set by this run
-              ansible.builtin.command:
-                argv: [maxctrl, clear, server, primary, drain]
-              delegate_to: maxscale
-              when: primary_drained is defined and primary_drained is succeeded and primary_recovered is defined and primary_recovered is succeeded
 
         - name: Generate the ZFS stream after donor recovery and traffic restoration
           ansible.builtin.script:
