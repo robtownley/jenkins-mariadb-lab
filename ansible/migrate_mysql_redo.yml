@@ -1,6 +1,6 @@
 ---
 - name: Move InnoDB redo onto its ibd ZFS dataset
-  hosts: database
+  hosts: rollout_order
   become: true
   serial: 1
   any_errors_fatal: true

@@ -57,6 +57,9 @@ for role, node in nodes.items():
         hosts[role]['replication_upstream'] = 'replica' + number
         hosts[role]['database_tier'] = 3
 
+# Rolling migrations visit children before their parents and the primary last.
+rollout_order = list(reversed(downstream)) + replicas + ["primary"]
+
 inventory = {
     "all": {
         "vars": {
@@ -76,6 +79,8 @@ inventory = {
                     "downstream_replicas": {"hosts": {name: hosts[name] for name in downstream}},
                 }},
             }},
+            # Same hosts as "database", listed in rollout order; serial: 1 plays follow it.
+            "rollout_order": {"hosts": {name: hosts[name] for name in rollout_order}},
             "proxy": {"hosts": {"maxscale": hosts["maxscale"]}},
             "ssm_monitoring": {"hosts": {"ssm": hosts["ssm"]} if "ssm" in hosts else {}},
             "monitoring": {"hosts": {"monitor": hosts["monitor"]} if "monitor" in hosts else {}},
@@ -84,5 +89,5 @@ inventory = {
 }
 Path("inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
 Path("replicas.txt").write_text("".join(name + "\n" for name in all_replicas))
-Path("database-order.txt").write_text("".join(name + "\n" for name in list(reversed(downstream)) + replicas + ["primary"]))
+Path("database-order.txt").write_text("".join(name + "\n" for name in rollout_order))
 print("Inventory generated for:", ", ".join(nodes))

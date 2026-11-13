@@ -23,6 +23,7 @@ if plan_path.exists():
     if not found:lines.append('  No DNS changes.')
     totals={a:sum(a in r['change']['actions'] for r in changes) for a in ['create','update','delete']}
     lines.extend(['',f'Terraform resources: {totals["create"]} additions, {totals["update"]} updates, {totals["delete"]} deletions.'])
+elif os.environ.get('CONFIG_ONLY')=='true': lines.append('CONFIG_ONLY: Terraform plan and apply were skipped; existing servers were reconfigured.')
 else: lines.append('No Terraform plan available; build stopped before a plan was saved.')
 if success and action=='APPLY':
     lines.extend(['','Dashboard: https://dashboard.roblabb.com','SSM metrics: https://ssm.roblabb.com','Login: rob (password stored in Jenkins credential)',''])
@@ -39,7 +40,7 @@ if success and action=='APPLY':
 elif success and action=='DESTROY':
     lines.extend(['','Lab resources and Terraform-managed DNS records removed.','Jenkins instance and the Route 53 hosted zone remain.','Dashboard is no longer deployed.'])
 elif success and action=='PLAN':lines.extend(['','Preview only: no infrastructure or configuration changes applied.'])
-else:lines.extend(['','Build failed: configuration may be partially completed. See the failed stage in console output.', 'Terraform plan was applied successfully before the later failure.' if applied else 'Terraform application was not confirmed; inspect state and rerun PLAN.','Dashboard availability has not been verified by this build.'])
+else:lines.extend(['','Build failed: configuration may be partially completed. See the failed stage in console output.', 'Terraform plan was applied successfully before the later failure.' if applied else 'Terraform was skipped (CONFIG_ONLY).' if os.environ.get('CONFIG_ONLY')=='true' else 'Terraform application was not confirmed; inspect state and rerun PLAN.','Dashboard availability has not been verified by this build.'])
 # Read actual DNS state when available; do not describe it as changes.
 if success and action=='APPLY':
     import subprocess

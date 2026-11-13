@@ -13,6 +13,8 @@ pipeline {
                description: 'Preview, provision, or remove the database lab')
         choice(name: 'REPLICA_COUNT', choices: ['2', '1', '3', '4', '5', '6'],
                description: 'Intermediate replicas; each adds sddsN, affiliate-feedN and heronN. Reducing destroys that entire branch and its disks. Select the CURRENT count for DESTROY.')
+        booleanParam(name: 'CONFIG_ONLY', defaultValue: false,
+                     description: 'APPLY only: skip Terraform plan/apply and rerun configuration against the servers that already exist. REPLICA_COUNT is ignored.')
     }
 
     environment {
@@ -24,9 +26,15 @@ pipeline {
         TF_PLUGIN_CACHE_DIR = '/var/lib/jenkins/.terraform.d/plugin-cache'
         // The lock file is regenerated each build (it is not committed), so allow the cache to be used for it.
         TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE = 'true'
+        ANSIBLE_PLAYBOOK = '/opt/jenkins-mariadb-venv/bin/ansible-playbook'
     }
 
     stages {
+        stage('Check parameters') {
+            when { expression { params.CONFIG_ONLY == true && params.ACTION != 'APPLY' } }
+            steps { error('CONFIG_ONLY can only be used with ACTION=APPLY.') }
+        }
+
         stage('Checkout') {
             steps {
                 deleteDir()
@@ -65,7 +73,7 @@ pipeline {
                     python3 -m unittest discover -s tests
                     # Every playbook (files with a top-level play); included task files are checked through them.
                     for playbook in $(grep -l '^  hosts:' ansible/*.yml); do
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                        "$ANSIBLE_PLAYBOOK" \
                             -i 'localhost,' "$playbook" --syntax-check
                     done
                 '''
@@ -74,6 +82,7 @@ pipeline {
         }
 
         stage('Plan infrastructure') {
+            when { expression { params.CONFIG_ONLY != true } }
             steps {
                 dir('terraform') {
                     sh '''
@@ -94,7 +103,7 @@ pipeline {
         }
 
         stage('Approve changes') {
-            when { expression { params.ACTION != 'PLAN' } }
+            when { expression { params.ACTION != 'PLAN' && params.CONFIG_ONLY != true } }
             steps {
                 timeout(time: 30, unit: 'MINUTES') {
                     input(
@@ -106,7 +115,7 @@ pipeline {
         }
 
         stage('Execute saved plan') {
-            when { expression { params.ACTION != 'PLAN' } }
+            when { expression { params.ACTION != 'PLAN' && params.CONFIG_ONLY != true } }
             steps {
                 dir('terraform') {
                     sh 'terraform apply -no-color -lock-timeout=60s tfplan && touch ../infrastructure-applied'
@@ -146,21 +155,21 @@ pipeline {
         stage('Install database software') {
             when { expression { params.ACTION == 'APPLY' } }
             steps {
-                sh '/opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/install.yml'
+                sh '"$ANSIBLE_PLAYBOOK" -i inventory.json ansible/install.yml'
             }
         }
 
         stage('Prepare ZFS mirrors') {
             when { expression { params.ACTION == 'APPLY' } }
             steps {
-                sh '/opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/prepare_zfs.yml'
+                sh '"$ANSIBLE_PLAYBOOK" -i inventory.json ansible/prepare_zfs.yml'
             }
         }
 
         stage('Configure hostnames and SSH hopping') {
             when { expression { params.ACTION == 'APPLY' } }
             steps {
-                sh '/opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/node_access.yml'
+                sh '"$ANSIBLE_PLAYBOOK" -i inventory.json ansible/node_access.yml'
             }
         }
 
@@ -177,7 +186,7 @@ pipeline {
                         set +x
                         set -eu
                         SEED_PLAN_ONLY=true ALLOW_PRIMARY_SEED=false \
-                            /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                            "$ANSIBLE_PLAYBOOK" \
                             -i inventory.json ansible/configure.yml --tags seed_plan
                     '''
                     script {
@@ -245,7 +254,7 @@ PYSEED
                             sh '''
                                 set +x
                                 set -eu
-                                /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                                "$ANSIBLE_PLAYBOOK" \
                                     -i inventory.json ansible/configure.yml
                             '''
                         }
@@ -257,20 +266,15 @@ PYSEED
         stage('Migrate MariaDB to ZFS') {
             when { expression { params.ACTION == 'APPLY' } }
             steps {
-                sh '''
-                    set -eu
-                    while IFS= read -r node; do
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                            -i inventory.json ansible/migrate_mysql_zfs.yml --limit "$node"
-                    done < database-order.txt
-                '''
+                // serial: 1 over the rollout_order group: one node at a time, children first, primary last.
+                sh '"$ANSIBLE_PLAYBOOK" -i inventory.json ansible/migrate_mysql_zfs.yml'
             }
         }
 
         stage('Verify replicas after migration') {
             when { expression { params.ACTION == 'APPLY' } }
             steps {
-                sh '/opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/verify_replication.yml --limit replicas'
+                sh '"$ANSIBLE_PLAYBOOK" -i inventory.json ansible/verify_replication.yml --limit replicas'
             }
         }
 
@@ -279,11 +283,9 @@ PYSEED
             steps {
                 sh '''
                     set -eu
-                    while IFS= read -r node; do
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                            -i inventory.json ansible/migrate_mysql_log_paths.yml --limit "$node"
-                    done < database-order.txt
-                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                    "$ANSIBLE_PLAYBOOK" \
+                        -i inventory.json ansible/migrate_mysql_log_paths.yml
+                    "$ANSIBLE_PLAYBOOK" \
                         -i inventory.json ansible/verify_replication.yml --limit replicas
                 '''
             }
@@ -294,11 +296,9 @@ PYSEED
             steps {
                 sh '''
                     set -eu
-                    while IFS= read -r node; do
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                            -i inventory.json ansible/migrate_mysql_redo.yml --limit "$node"
-                    done < database-order.txt
-                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                    "$ANSIBLE_PLAYBOOK" \
+                        -i inventory.json ansible/migrate_mysql_redo.yml
+                    "$ANSIBLE_PLAYBOOK" \
                         -i inventory.json ansible/verify_replication.yml --limit replicas
                 '''
             }
@@ -310,7 +310,7 @@ PYSEED
             steps {
                 sh '''
                     set -eu
-                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                    "$ANSIBLE_PLAYBOOK" \
                         -i inventory.json ansible/configure_sanoid.yml
                 '''
             }
@@ -319,7 +319,7 @@ PYSEED
         stage('Configure cluster monitoring') {
             when { expression { params.ACTION == 'APPLY' } }
             steps {
-                sh '/opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/configure_monitoring.yml'
+                sh '"$ANSIBLE_PLAYBOOK" -i inventory.json ansible/configure_monitoring.yml'
             }
         }
 
@@ -331,7 +331,7 @@ PYSEED
                     sh '''
                         set +x
                         set -eu
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/public_dashboard.yml
+                        "$ANSIBLE_PLAYBOOK" -i inventory.json ansible/public_dashboard.yml
                     '''
                 }
             }
@@ -347,9 +347,9 @@ PYSEED
                     sh '''
                         set +x
                         set -eu
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/configure_ssm_server.yml
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/public_ssm.yml
-                        /opt/jenkins-mariadb-venv/bin/ansible-playbook -i inventory.json ansible/configure_ssm_clients.yml
+                        "$ANSIBLE_PLAYBOOK" -i inventory.json ansible/configure_ssm_server.yml
+                        "$ANSIBLE_PLAYBOOK" -i inventory.json ansible/public_ssm.yml
+                        "$ANSIBLE_PLAYBOOK" -i inventory.json ansible/configure_ssm_clients.yml
                     '''
                 }
             }
