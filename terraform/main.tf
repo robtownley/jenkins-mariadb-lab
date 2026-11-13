@@ -22,7 +22,10 @@ locals {
     }
   ]...)
   database_nodes = merge({ primary = "mariadb-primary" }, local.replicas, local.downstream_replicas)
-  nodes          = merge(local.database_nodes, { maxscale = "mariadb-maxscale" })
+  nodes          = merge(local.database_nodes, { maxscale = "mariadb-maxscale" }, local.feature_nodes)
+
+  # Nodes whose size does not follow db_instance_type.
+  fixed_instance_types = merge({ maxscale = "t3.small" }, { for name in keys(local.loadgen_nodes) : name => "t3.small" })
 
   mysql_zfs_disks = merge([
     for node in keys(local.database_nodes) : {
@@ -90,6 +93,13 @@ resource "aws_security_group" "maxscale" {
     to_port         = 3306
     protocol        = "tcp"
     security_groups = [local.jenkins_sg_id]
+  }
+  ingress {
+    description     = "Application traffic from load generators"
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.loadgen.id]
   }
   ingress {
     description     = "Proxy health from monitoring server"
@@ -189,15 +199,18 @@ resource "aws_security_group" "lab_ssh" {
   tags = { Name = "jenkins-mariadb-lab-internal-ssh" }
 }
 
+# ignore_changes below keeps existing servers on the image they were built from.
 resource "aws_instance" "node" {
   for_each                    = local.nodes
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = "t3.small"
+  ami                         = local.node_ami
+  instance_type               = lookup(local.fixed_instance_types, each.key, var.db_instance_type)
   subnet_id                   = local.subnet_id
   associate_public_ip_address = true
   key_name                    = aws_key_pair.lab.key_name
   vpc_security_group_ids = [
-    each.key == "maxscale" ? aws_security_group.maxscale.id : aws_security_group.database.id,
+    each.key == "maxscale" ? aws_security_group.maxscale.id : (
+      contains(keys(local.loadgen_nodes), each.key) ? aws_security_group.loadgen.id : aws_security_group.database.id
+    ),
     aws_security_group.lab_ssh.id
   ]
   root_block_device {
@@ -261,7 +274,7 @@ output "nodes" {
       instance_id = instance.id
       private_ip  = instance.private_ip
       public_ip   = instance.public_ip
-      zfs_volume_ids = role == "maxscale" ? [] : [
+      zfs_volume_ids = !contains(keys(local.database_nodes), role) ? [] : [
         aws_ebs_volume.mysql_zfs["${role}-a"].id,
         aws_ebs_volume.mysql_zfs["${role}-b"].id
       ]
