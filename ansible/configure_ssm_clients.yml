@@ -27,11 +27,18 @@
         mode: '0644'
         content: |
           deb [signed-by=/usr/share/keyrings/SS-SSM-9.5-archive-keyring.pgp] https://dl.shatteredsilicon.net/ssm/9.5/DEBS/ stable main
+    - name: Check whether the SSM client is installed
+      ansible.builtin.command: dpkg-query -W -f=${Version} ssm-client
+      register: installed_ssm_client
+      changed_when: false
+      failed_when: false
+    # Refresh apt only when the client is missing, so a newly added repository is seen.
     - name: Install SSM client
       ansible.builtin.apt:
         name: ssm-client
         state: present
         update_cache: true
+        cache_valid_time: "{{ 3600 if installed_ssm_client.rc == 0 and installed_ssm_client.stdout | length > 0 else 0 }}"
     - name: Route SSM hostname to its private address for this client
       ansible.builtin.blockinfile:
         path: /etc/hosts
