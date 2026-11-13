@@ -11,3 +11,6 @@ inventory.ini
 inventory.json
 lab-known-hosts
 .ansible-facts/
+instances-started
+*-report.txt
+packer-manifest.json
