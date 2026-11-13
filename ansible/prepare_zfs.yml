@@ -1,8 +1,8 @@
 ---
-- name: Prepare mirrored ZFS storage
+# Package installs touch no disks, so they run on every node at once.
+- name: Install ZFS tools on all database nodes
   hosts: database
   become: true
-  serial: 1
   any_errors_fatal: true
 
   tasks:
@@ -20,6 +20,13 @@
       ansible.builtin.command: modprobe zfs
       changed_when: false
 
+- name: Prepare mirrored ZFS storage
+  hosts: database
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  tasks:
     - name: Require two distinct Terraform volume IDs
       ansible.builtin.assert:
         that:

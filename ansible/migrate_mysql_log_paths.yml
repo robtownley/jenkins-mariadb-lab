@@ -1,6 +1,6 @@
 ---
 - name: Put MariaDB logs and temporary files on their ZFS datasets
-  hosts: database
+  hosts: rollout_order
   become: true
   serial: 1
   any_errors_fatal: true

@@ -30,6 +30,12 @@ def entries(nodes):
             alias, order = 'mariadb-monitor', (3, 0)
         elif role == 'maxscale':
             alias, order = 'mariadb-maxscale', (2, 0)
+        elif role == 'orders-primary':
+            alias, order = 'mariadb-orders-primary', (1, 4000)
+        elif role == 'warehouse':
+            alias, order = 'mariadb-warehouse', (1, 5000)
+        elif re.fullmatch(r'loadgen[1-9]', role):
+            alias, order = f'mariadb-loadgen-{role[7:]}', (5, int(role[7:]))
         elif re.fullmatch(r'replica[1-9][0-9]?', role):
             number = int(role[7:])
             alias, order = f'mariadb-replica-{number}', (1, number)

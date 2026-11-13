@@ -63,7 +63,11 @@
             "replica6.roblabb.com",
             "sdds6.roblabb.com",
             "affiliate-feed6.roblabb.com",
-            "heron6.roblabb.com"
+            "heron6.roblabb.com",
+            "orders-primary.roblabb.com",
+            "warehouse.roblabb.com",
+            "loadgen1.roblabb.com",
+            "loadgen2.roblabb.com"
           ],
           "route53:ChangeResourceRecordSetsRecordTypes": [
             "A"

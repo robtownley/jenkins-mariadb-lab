@@ -48,6 +48,13 @@ class TopologyTests(unittest.TestCase):
             self.assertEqual(len(direct), count)
             self.assertEqual(len(children), count * 3)
             self.assertEqual(len(order), 1 + count * 4)
+            # Migration playbooks run serial: 1 over this group, so it must match the rollout order exactly.
+            self.assertEqual(list(inv['all']['children']['rollout_order']['hosts']), order)
+            self.assertEqual(order[-1], 'primary')
+            for name in order:
+                parent = (direct.get(name) or children.get(name) or {}).get('replication_upstream')
+                if parent:
+                    self.assertLess(order.index(name), order.index(parent), f'{name} must migrate before {parent}')
             self.assertEqual(order[-1], 'primary')
             ids = [1] + [h['mariadb_server_id'] for h in list(direct.values()) + list(children.values())]
             self.assertEqual(len(ids), len(set(ids)))

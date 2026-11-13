@@ -1,8 +1,8 @@
 ---
-- name: Install system and MySQL metrics on primary and replicas
-  hosts: database
+# Package and repository setup is independent per node, so it runs on every node at once.
+- name: Install the SSM client on primary and replicas
+  hosts: database:multisource
   become: true
-  serial: 1
   any_errors_fatal: true
   tasks:
     - name: Require credentials
@@ -44,6 +44,13 @@
         path: /etc/hosts
         marker: '# {mark} SSM PRIVATE METRICS'
         block: "{{ hostvars['ssm'].ansible_host }} ssm.roblabb.com"
+
+- name: Register system and MySQL metrics on primary and replicas
+  hosts: database:multisource
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
     - name: Create local metrics account without replicating account changes
       community.mysql.mysql_query:
         login_unix_socket: /run/mysqld/mysqld.sock

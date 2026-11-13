@@ -9,8 +9,9 @@ nodes = json.loads(Path("nodes.json").read_text())
 if "primary" not in nodes or "maxscale" not in nodes:
     raise SystemExit("Terraform output must include primary and maxscale.")
 
-unexpected = [name for name in nodes if name not in ("primary", "maxscale", "monitor", "ssm")
-              and not re.fullmatch(r"(?:replica|sdds|affiliate-feed|heron)[1-9][0-9]*", name)]
+FEATURE_NODES = ("orders-primary", "warehouse")
+unexpected = [name for name in nodes if name not in ("primary", "maxscale", "monitor", "ssm") + FEATURE_NODES
+              and not re.fullmatch(r"(?:replica|sdds|affiliate-feed|heron|loadgen)[1-9][0-9]*", name)]
 if unexpected:
     raise SystemExit(f"Unexpected node names: {unexpected}")
 
@@ -23,6 +24,10 @@ for name in downstream:
     if parent not in replicas:
         raise SystemExit(f'{name} requires upstream {parent}')
 all_replicas = replicas + downstream
+loadgens = sorted((name for name in nodes if re.fullmatch(r"loadgen[1-9][0-9]*", name)), key=lambda name: int(name[7:]))
+multisource = [name for name in FEATURE_NODES if name in nodes]
+if len(multisource) == 1:
+    raise SystemExit("orders-primary and warehouse must be deployed together.")
 # Keep private addresses for replication; only the SSH transport uses public IPs.
 ssh_common_args = (
     "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
@@ -56,6 +61,16 @@ for role, node in nodes.items():
         hosts[role]['mariadb_server_id'] = {'sdds': 1000, 'affiliate-feed': 2000, 'heron': 3000}[family] + int(number)
         hosts[role]['replication_upstream'] = 'replica' + number
         hosts[role]['database_tier'] = 3
+    elif role == "orders-primary":
+        # An independent primary with its own GTID domain, so warehouse can follow both.
+        hosts[role]["mariadb_server_id"] = 4001
+        hosts[role]["gtid_domain_id"] = 2
+    elif role == "warehouse":
+        hosts[role]["mariadb_server_id"] = 5001
+        hosts[role]["gtid_domain_id"] = 5
+
+# Rolling migrations visit children before their parents and the primary last.
+rollout_order = list(reversed(downstream)) + replicas + ["primary"]
 
 inventory = {
     "all": {
@@ -76,6 +91,14 @@ inventory = {
                     "downstream_replicas": {"hosts": {name: hosts[name] for name in downstream}},
                 }},
             }},
+            # Same hosts as "database", listed in rollout order; serial: 1 plays follow it.
+            "rollout_order": {"hosts": {name: hosts[name] for name in rollout_order}},
+            # Always present (possibly empty) so playbooks can name them unconditionally.
+            "multisource": {"children": {
+                "orders_writer": {"hosts": {"orders-primary": hosts["orders-primary"]} if multisource else {}},
+                "warehouse_nodes": {"hosts": {"warehouse": hosts["warehouse"]} if multisource else {}},
+            }},
+            "loadgen": {"hosts": {name: hosts[name] for name in loadgens}},
             "proxy": {"hosts": {"maxscale": hosts["maxscale"]}},
             "ssm_monitoring": {"hosts": {"ssm": hosts["ssm"]} if "ssm" in hosts else {}},
             "monitoring": {"hosts": {"monitor": hosts["monitor"]} if "monitor" in hosts else {}},
@@ -84,5 +107,5 @@ inventory = {
 }
 Path("inventory.json").write_text(json.dumps(inventory, indent=2) + "\n")
 Path("replicas.txt").write_text("".join(name + "\n" for name in all_replicas))
-Path("database-order.txt").write_text("".join(name + "\n" for name in list(reversed(downstream)) + replicas + ["primary"]))
+Path("database-order.txt").write_text("".join(name + "\n" for name in rollout_order))
 print("Inventory generated for:", ", ".join(nodes))

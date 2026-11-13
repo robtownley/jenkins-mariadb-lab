@@ -1,0 +1,357 @@
+---
+# Resilience drills (ACTION=DRILL). Each drill puts the lab back as it found it, then verifies replication.
+#   -e drill=SWITCHOVER_ROUNDTRIP|FAILOVER_ROUNDTRIP|REPLICA_RESTART|NETWORK_DELAY|SQL_THREAD_PAUSE
+#   -e drill_target=<replica>
+
+- name: Check the requested drill
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    cluster_drills: [SWITCHOVER_ROUNDTRIP, FAILOVER_ROUNDTRIP]
+    replica_drills: [REPLICA_RESTART, NETWORK_DELAY, SQL_THREAD_PAUSE]
+  tasks:
+    - name: Require a known drill and a suitable target
+      ansible.builtin.assert:
+        that:
+          - drill in cluster_drills + replica_drills
+          - drill != 'SWITCHOVER_ROUNDTRIP' or drill_target in groups['intermediate_replicas']
+          - drill not in replica_drills or drill_target in groups['replicas']
+        fail_msg: >-
+          {{ drill }} on {{ drill_target }} is not possible. Switchover needs an intermediate replica
+          ({{ groups['intermediate_replicas'] | join(', ') }}); replica drills need one of {{ groups['replicas'] | join(', ') }}.
+
+    - name: Note the start time
+      ansible.builtin.set_fact:
+        drill_started: "{{ now(utc=true).isoformat() }}"
+
+# ---------------------------------------------------------------------------
+# Switchover / failover round trips, driven by MaxScale's mariadbmon.
+# ---------------------------------------------------------------------------
+
+- name: Grant MaxScale the privileges cluster operations need (for this drill only)
+  hosts: primary
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    - name: Grant cluster-operation privileges and a replication account for the primary
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - >-
+            GRANT SUPER, RELOAD, PROCESS, SHOW DATABASES, EVENT, READ_ONLY ADMIN, REPLICATION SLAVE ADMIN,
+            BINLOG ADMIN, CONNECTION ADMIN, REPLICA MONITOR ON *.* TO 'lab_monitor'@'{{ hostvars['maxscale'].ansible_host }}'
+          - "GRANT SELECT ON mysql.* TO 'lab_monitor'@'{{ hostvars['maxscale'].ansible_host }}'"
+          # When a replica is promoted, the old primary replicates from it with this account.
+          - "CREATE USER IF NOT EXISTS 'lab_repl'@'{{ ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "GRANT REPLICATION SLAVE ON *.* TO 'lab_repl'@'{{ ansible_host }}'"
+      when: drill in ['SWITCHOVER_ROUNDTRIP', 'FAILOVER_ROUNDTRIP']
+      no_log: true
+
+- name: Wait for the grants to replicate to every possible new master
+  hosts: intermediate_replicas
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Check the monitor account's privileges here
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: "SHOW GRANTS FOR 'lab_monitor'@'{{ hostvars['maxscale'].ansible_host }}'"
+      register: replicated_grants
+      until: replicated_grants.query_result[0] | map('dict2items') | flatten | map(attribute='value') | select('search', 'READ_ONLY ADMIN') | list | length > 0
+      retries: 30
+      delay: 2
+      when: drill in ['SWITCHOVER_ROUNDTRIP', 'FAILOVER_ROUNDTRIP']
+
+- name: Run the cluster drill through MaxScale
+  hosts: proxy
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    - name: Cluster drill
+      when: drill in ['SWITCHOVER_ROUNDTRIP', 'FAILOVER_ROUNDTRIP']
+      block:
+        - name: Give the monitor replication credentials for redirecting replicas
+          ansible.builtin.command:
+            argv: [maxctrl, alter, monitor, MariaDB-Monitor, replication_user, lab_repl, replication_password, "{{ lab_repl_password }}"]
+          no_log: true
+
+        - name: Require primary to be the current master
+          ansible.builtin.command:
+            argv: [maxctrl, api, get, servers/primary, data.attributes.state]
+          register: primary_state
+          changed_when: false
+          failed_when: "'Master' not in primary_state.stdout"
+
+        # --- switchover ---
+        - name: Switch the primary role to {{ drill_target }}
+          ansible.builtin.command:
+            argv: [maxctrl, call, command, mariadbmon, switchover, MariaDB-Monitor, "{{ drill_target }}", primary]
+          when: drill == 'SWITCHOVER_ROUNDTRIP'
+
+        # --- failover ---
+        - name: Make the primary come back read-only after it is stopped
+          ansible.builtin.copy:
+            dest: /etc/mysql/mariadb.conf.d/99-lab-drill.cnf
+            mode: "0644"
+            content: |
+              # Written by the FAILOVER_ROUNDTRIP drill; removed when it completes.
+              [mariadb]
+              read_only=1
+              skip_slave_start=1
+          delegate_to: primary
+          when: drill == 'FAILOVER_ROUNDTRIP'
+
+        - name: Stop MariaDB on the primary
+          ansible.builtin.systemd_service:
+            name: mariadb
+            state: stopped
+          delegate_to: primary
+          when: drill == 'FAILOVER_ROUNDTRIP'
+
+        - name: Wait for MaxScale to see the primary down
+          ansible.builtin.command:
+            argv: [maxctrl, api, get, servers/primary, data.attributes.state]
+          register: down_state
+          changed_when: false
+          until: "'Down' in down_state.stdout"
+          retries: 30
+          delay: 2
+          when: drill == 'FAILOVER_ROUNDTRIP'
+
+        - name: Fail over to the most up-to-date replica
+          ansible.builtin.command:
+            argv: [maxctrl, call, command, mariadbmon, failover, MariaDB-Monitor]
+          when: drill == 'FAILOVER_ROUNDTRIP'
+
+        # --- both ---
+        - name: Find the new master
+          ansible.builtin.command:
+            argv: [maxctrl, --tsv, list, servers]
+          register: server_list
+          changed_when: false
+          until: >-
+            server_list.stdout_lines | map('split', '\t') | selectattr('4', 'search', 'Master')
+            | rejectattr('0', 'equalto', 'primary') | list | length == 1
+          retries: 30
+          delay: 2
+
+        - name: Remember the new master
+          ansible.builtin.set_fact:
+            drill_new_master: >-
+              {{ (server_list.stdout_lines | map('split', '\t') | selectattr('4', 'search', 'Master')
+                  | rejectattr('0', 'equalto', 'primary') | first)[0] }}
+
+        - name: Write through MaxScale while {{ drill_new_master }} is master
+          community.mysql.mysql_query:
+            login_host: 127.0.0.1
+            login_port: 3306
+            login_user: lab_app
+            login_password: "{{ lab_app_password }}"
+            config_file: ""
+            query: INSERT INTO lab.pipeline_checks (marker) VALUES (%s) ON DUPLICATE KEY UPDATE marker = VALUES(marker)
+            positional_args:
+              - "{{ lab_test_marker }}-{{ drill | lower }}"
+          register: drill_write
+          until: drill_write is succeeded
+          retries: 30
+          delay: 2
+          no_log: true
+
+        - name: Start the old primary again (read-only)
+          ansible.builtin.systemd_service:
+            name: mariadb
+            state: started
+          delegate_to: primary
+          when: drill == 'FAILOVER_ROUNDTRIP'
+
+        - name: Rejoin the old primary as a replica of {{ drill_new_master }}
+          ansible.builtin.command:
+            argv: [maxctrl, call, command, mariadbmon, rejoin, MariaDB-Monitor, primary]
+          register: rejoin
+          until: rejoin is succeeded
+          retries: 10
+          delay: 3
+          when: drill == 'FAILOVER_ROUNDTRIP'
+
+        - name: Wait for the old primary to replicate
+          ansible.builtin.command:
+            argv: [maxctrl, api, get, servers/primary, data.attributes.state]
+          register: rejoined_state
+          changed_when: false
+          until: "'Slave' in rejoined_state.stdout"
+          retries: 30
+          delay: 2
+
+        - name: Switch the primary role back to primary
+          ansible.builtin.command:
+            argv: [maxctrl, call, command, mariadbmon, switchover, MariaDB-Monitor, primary, "{{ drill_new_master }}"]
+
+        - name: Wait for primary to be master again
+          ansible.builtin.command:
+            argv: [maxctrl, api, get, servers/primary, data.attributes.state]
+          register: final_state
+          changed_when: false
+          until: "'Master' in final_state.stdout"
+          retries: 30
+          delay: 2
+
+        - name: Remove the failover drill override (takes effect at the next restart)
+          ansible.builtin.file:
+            path: /etc/mysql/mariadb.conf.d/99-lab-drill.cnf
+            state: absent
+          delegate_to: primary
+
+      rescue:
+        - name: Show where MaxScale thinks the cluster is
+          ansible.builtin.command: maxctrl list servers
+          register: rescue_servers
+          changed_when: false
+          failed_when: false
+
+        - name: Stop and leave the cluster for inspection
+          ansible.builtin.fail:
+            msg: |
+              The {{ drill }} drill did not complete, so nothing else was changed.
+              primary may not be the writer right now. MaxScale reports:
+              {{ rescue_servers.stdout | default('(unavailable)') }}
+              Inspect before running APPLY. If primary was stopped, /etc/mysql/mariadb.conf.d/99-lab-drill.cnf
+              keeps it read-only until you remove it.
+
+- name: Remove the drill-only MaxScale privileges
+  hosts: primary
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Confirm primary is writable again
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT @@read_only AS read_only
+      register: primary_read_only
+      failed_when: primary_read_only.query_result[0][0].read_only | int != 0
+      when: drill in ['SWITCHOVER_ROUNDTRIP', 'FAILOVER_ROUNDTRIP']
+
+    - name: Revoke cluster-operation privileges, keeping REPLICA MONITOR
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - >-
+            REVOKE SUPER, RELOAD, PROCESS, SHOW DATABASES, EVENT, READ_ONLY ADMIN, REPLICATION SLAVE ADMIN,
+            BINLOG ADMIN, CONNECTION ADMIN ON *.* FROM 'lab_monitor'@'{{ hostvars['maxscale'].ansible_host }}'
+          - "REVOKE SELECT ON mysql.* FROM 'lab_monitor'@'{{ hostvars['maxscale'].ansible_host }}'"
+      when: drill in ['SWITCHOVER_ROUNDTRIP', 'FAILOVER_ROUNDTRIP']
+
+# ---------------------------------------------------------------------------
+# Single-replica drills. Each one schedules its own undo on the server first,
+# so the replica recovers even if Jenkins loses its connection mid-drill.
+# ---------------------------------------------------------------------------
+
+- name: Disturb one replica and watch it recover
+  # The default only matters for --syntax-check, which runs without extra vars.
+  hosts: "{{ drill_target | default('no_drill_target') }}"
+  become: true
+  any_errors_fatal: true
+  vars:
+    drill_seconds: 120
+  tasks:
+    - name: Replica drill
+      when: drill in ['REPLICA_RESTART', 'NETWORK_DELAY', 'SQL_THREAD_PAUSE']
+      block:
+        - name: Install the lag sampler
+          ansible.builtin.copy:
+            src: files/lab_lag_sample.py
+            dest: /usr/local/sbin/lab-lag-sample
+            mode: "0755"
+
+        # --- restart ---
+        - name: Restart MariaDB
+          ansible.builtin.systemd_service:
+            name: mariadb
+            state: restarted
+          when: drill == 'REPLICA_RESTART'
+
+        # --- network delay ---
+        - name: Load the network emulator
+          ansible.builtin.shell: |
+            modprobe sch_netem 2>/dev/null && exit 0
+            apt-get install -y "linux-modules-extra-$(uname -r)" >/dev/null && modprobe sch_netem
+          changed_when: false
+          when: drill == 'NETWORK_DELAY'
+
+        - name: Schedule removal of the delay in case this play is interrupted
+          ansible.builtin.command:
+            argv: [systemd-run, --unit=lab-drill-undo, "--on-active={{ drill_seconds + 120 }}",
+                   /usr/sbin/tc, qdisc, del, dev, "{{ ansible_default_ipv4.interface }}", root]
+          when: drill == 'NETWORK_DELAY'
+
+        - name: Add 250ms (+/-50ms) latency to every packet leaving {{ inventory_hostname }}
+          ansible.builtin.command:
+            argv: [tc, qdisc, replace, dev, "{{ ansible_default_ipv4.interface }}", root, netem, delay, 250ms, 50ms]
+          when: drill == 'NETWORK_DELAY'
+
+        # --- SQL thread pause ---
+        - name: Schedule the SQL thread restart in case this play is interrupted
+          ansible.builtin.command:
+            argv: [systemd-run, --unit=lab-drill-undo, "--on-active={{ drill_seconds + 120 }}",
+                   /usr/bin/mariadb, -e, START SLAVE SQL_THREAD]
+          when: drill == 'SQL_THREAD_PAUSE'
+
+        - name: Pause the SQL thread (events still arrive, none are applied)
+          community.mysql.mysql_query:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            query: STOP SLAVE SQL_THREAD
+          when: drill == 'SQL_THREAD_PAUSE'
+
+        # --- all ---
+        - name: Sample replication lag during the drill
+          ansible.builtin.command: /usr/bin/python3 /usr/local/sbin/lab-lag-sample {{ 60 if drill == 'REPLICA_RESTART' else drill_seconds }} 5
+          register: drill_lag
+          changed_when: false
+
+      always:
+        - name: Remove the network delay
+          ansible.builtin.command:
+            argv: [tc, qdisc, del, dev, "{{ ansible_default_ipv4.interface }}", root]
+          failed_when: false
+          when: drill == 'NETWORK_DELAY'
+
+        - name: Resume the SQL thread
+          community.mysql.mysql_query:
+            login_unix_socket: /run/mysqld/mysqld.sock
+            query: START SLAVE SQL_THREAD
+          failed_when: false
+          when: drill == 'SQL_THREAD_PAUSE'
+
+        - name: Cancel the scheduled undo
+          ansible.builtin.shell: systemctl stop lab-drill-undo.timer lab-drill-undo.service 2>/dev/null || true
+          changed_when: false
+          when: drill in ['NETWORK_DELAY', 'SQL_THREAD_PAUSE']
+
+- name: Write the drill report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Write drill-report.txt
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../drill-report.txt"
+        mode: "0644"
+        content: |
+          Drill: {{ drill }}{{ '' if drill == 'FAILOVER_ROUNDTRIP' else ' on ' ~ drill_target }}
+          Started: {{ drill_started }}  Finished: {{ now(utc=true).isoformat() }}
+          {% if drill in ['SWITCHOVER_ROUNDTRIP', 'FAILOVER_ROUNDTRIP'] %}
+          Temporary master: {{ hostvars['maxscale'].drill_new_master | default('unknown') }}; a write through MaxScale succeeded while it was master.
+          primary is master again and writable; drill-only MaxScale privileges were revoked.
+          {% else %}
+          {% set lag = (hostvars[drill_target].drill_lag.stdout | default('{}')) | from_json %}
+          {% for name, stats in (lag.channels | default({})).items() %}
+          Channel {{ name }}: max lag {{ stats.max_lag }}s, broken for {{ stats.broken_samples }}/{{ lag.samples }} samples, lag at the end {{ stats.last_lag }}s.
+          {% endfor %}
+          {% endif %}
+          Replication on every replica was verified after the drill (see the console log).
+
+- import_playbook: verify_replication.yml
