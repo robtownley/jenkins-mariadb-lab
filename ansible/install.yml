@@ -4,6 +4,8 @@
   become: true
   gather_facts: false
   any_errors_fatal: true
+  vars:
+    lab_mariadb_version: "{{ lookup('ansible.builtin.env', 'LAB_MARIADB_VERSION') | default('11.4', true) }}"
 
   tasks:
     - name: Wait for SSH and Python
@@ -43,20 +45,22 @@
         mode: "0755"
         checksum: "sha256:b54c87edfe81b9837ef44a4a4f39383dd8df32776e6a18c0743a5d3ece044ac3"
 
-    - name: Configure only the MariaDB 11.4 repository
+    - name: Configure only the MariaDB {{ lab_mariadb_version }} repository
       ansible.builtin.command:
         argv:
           - /usr/local/sbin/mariadb_repo_setup
-          - --mariadb-server-version=mariadb-11.4
+          - --mariadb-server-version=mariadb-{{ lab_mariadb_version }}
           - --skip-maxscale
           - --skip-tools
           - --list
       changed_when: true
 
-- name: Install MariaDB on the three database nodes
-  hosts: database
+- name: Install MariaDB on the database nodes
+  hosts: database:multisource
   become: true
   any_errors_fatal: true
+  vars:
+    lab_mariadb_version: "{{ lookup('ansible.builtin.env', 'LAB_MARIADB_VERSION') | default('11.4', true) }}"
 
   tasks:
     - name: Read the installed MariaDB server package version
@@ -65,8 +69,16 @@
       changed_when: false
       failed_when: false
 
-    # A fresh node must refresh apt to see the 11.4 repository added above;
-    # an existing 11.4 node can reuse a recent package list.
+    - name: Refuse an in-place change of MariaDB series
+      ansible.builtin.assert:
+        that:
+          - installed_mariadb.rc != 0 or installed_mariadb.stdout == '' or (':' ~ lab_mariadb_version ~ '.') in installed_mariadb.stdout
+        fail_msg: >-
+          {{ inventory_hostname }} runs MariaDB {{ installed_mariadb.stdout }} but MARIADB_VERSION is {{ lab_mariadb_version }}.
+          In-place upgrades are not automated; choose the series the lab already runs.
+
+    # A fresh node must refresh apt to see the repository added above;
+    # an existing node on the requested series can reuse a recent package list.
     - name: Install MariaDB packages
       ansible.builtin.apt:
         name:
@@ -75,7 +87,7 @@
           - mariadb-backup
         state: present
         update_cache: true
-        cache_valid_time: "{{ 3600 if installed_mariadb.rc == 0 and ':11.4.' in installed_mariadb.stdout else 0 }}"
+        cache_valid_time: "{{ 3600 if installed_mariadb.rc == 0 and (':' ~ lab_mariadb_version ~ '.') in installed_mariadb.stdout else 0 }}"
         lock_timeout: 300
 
     - name: Enable and start MariaDB
@@ -95,10 +107,10 @@
       register: server_version
       changed_when: false
 
-    - name: Confirm MariaDB 11.4 is running
+    - name: Confirm the requested MariaDB series is running
       ansible.builtin.assert:
         that:
-          - server_version.stdout.startswith('11.4.')
+          - server_version.stdout.startswith(lab_mariadb_version ~ '.')
         fail_msg: "Unexpected MariaDB version: {{ server_version.stdout }}"
 
     - name: Report database version
@@ -109,6 +121,8 @@
   hosts: proxy
   become: true
   any_errors_fatal: true
+  vars:
+    lab_mariadb_version: "{{ lookup('ansible.builtin.env', 'LAB_MARIADB_VERSION') | default('11.4', true) }}"
 
   tasks:
     - name: Read the installed MariaDB client package version
@@ -124,7 +138,7 @@
           - xz-utils
         state: present
         update_cache: true
-        cache_valid_time: "{{ 3600 if installed_client.rc == 0 and ':11.4.' in installed_client.stdout else 0 }}"
+        cache_valid_time: "{{ 3600 if installed_client.rc == 0 and (':' ~ lab_mariadb_version ~ '.') in installed_client.stdout else 0 }}"
         lock_timeout: 300
 
     - name: Download the published MaxScale Ubuntu Noble package

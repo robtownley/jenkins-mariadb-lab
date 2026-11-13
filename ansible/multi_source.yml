@@ -1,0 +1,209 @@
+---
+# Multi-source lab (MULTI_SOURCE=true):
+#   orders-primary  an independent primary (GTID domain 2) that writes orders.orders every 5 seconds
+#   warehouse       follows primary over channel 'main' (lab.*) and orders-primary over channel 'orders' (orders.*)
+
+- name: Configure orders-primary as an independent primary
+  hosts: orders_writer
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    - name: Configure server ID, GTID domain and binary logging
+      ansible.builtin.copy:
+        dest: /etc/mysql/mariadb.conf.d/60-lab.cnf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [mariadb]
+          bind_address=0.0.0.0
+          skip_name_resolve=1
+          server_id={{ mariadb_server_id }}
+          gtid_domain_id={{ gtid_domain_id }}
+          log_bin=/var/lib/mysql/mariadb-bin
+          binlog_format=ROW
+          gtid_strict_mode=1
+          read_only=0
+          sync_binlog=1
+          innodb_flush_log_at_trx_commit=1
+          binlog_expire_logs_seconds=604800
+          innodb_buffer_pool_size=256M
+          max_connections=100
+          event_scheduler=ON
+      notify: Restart MariaDB
+
+    - name: Apply settings
+      ansible.builtin.meta: flush_handlers
+
+    - name: Create the orders schema and a steady trickle of orders
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - CREATE DATABASE IF NOT EXISTS orders
+          - |
+            CREATE TABLE IF NOT EXISTS orders.orders (
+              id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+              customer VARCHAR(40) NOT NULL,
+              amount DECIMAL(10,2) NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              KEY created_at (created_at)
+            )
+          - >-
+            CREATE EVENT IF NOT EXISTS orders.new_order ON SCHEDULE EVERY 5 SECOND
+            DO INSERT INTO orders.orders (customer, amount)
+            VALUES (CONCAT('customer-', FLOOR(RAND() * 1000)), ROUND(RAND() * 500, 2))
+          - >-
+            CREATE EVENT IF NOT EXISTS orders.purge_old ON SCHEDULE EVERY 1 HOUR
+            DO DELETE FROM orders.orders WHERE created_at < NOW() - INTERVAL 7 DAY
+
+    - name: Allow warehouse to replicate and take its seed dump
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - "CREATE USER IF NOT EXISTS 'lab_repl'@'{{ hostvars['warehouse'].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "ALTER USER 'lab_repl'@'{{ hostvars['warehouse'].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "GRANT REPLICATION SLAVE ON *.* TO 'lab_repl'@'{{ hostvars['warehouse'].ansible_host }}'"
+          - "CREATE USER IF NOT EXISTS 'lab_dump'@'{{ hostvars['warehouse'].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "ALTER USER 'lab_dump'@'{{ hostvars['warehouse'].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "GRANT SELECT, SHOW VIEW, TRIGGER, LOCK TABLES ON orders.* TO 'lab_dump'@'{{ hostvars['warehouse'].ansible_host }}'"
+          - "GRANT RELOAD, BINLOG MONITOR ON *.* TO 'lab_dump'@'{{ hostvars['warehouse'].ansible_host }}'"
+      no_log: true
+
+  handlers:
+    - name: Restart MariaDB
+      ansible.builtin.systemd_service:
+        name: mariadb
+        state: restarted
+
+- name: Allow warehouse to replicate lab.* from the main primary
+  hosts: primary
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    # Written to the binlog like the existing replica accounts, so replicas carry them too.
+    - name: Create warehouse replication and seed accounts
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - "CREATE USER IF NOT EXISTS 'lab_repl'@'{{ hostvars['warehouse'].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "ALTER USER 'lab_repl'@'{{ hostvars['warehouse'].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "GRANT REPLICATION SLAVE ON *.* TO 'lab_repl'@'{{ hostvars['warehouse'].ansible_host }}'"
+          - "CREATE USER IF NOT EXISTS 'lab_dump'@'{{ hostvars['warehouse'].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "ALTER USER 'lab_dump'@'{{ hostvars['warehouse'].ansible_host }}' IDENTIFIED BY '{{ lab_repl_password }}'"
+          - "GRANT SELECT, SHOW VIEW, TRIGGER, LOCK TABLES ON lab.* TO 'lab_dump'@'{{ hostvars['warehouse'].ansible_host }}'"
+          - "GRANT RELOAD, BINLOG MONITOR ON *.* TO 'lab_dump'@'{{ hostvars['warehouse'].ansible_host }}'"
+      no_log: true
+
+- name: Configure, seed and verify the multi-source warehouse
+  hosts: warehouse_nodes
+  become: true
+  any_errors_fatal: true
+  vars_files:
+    - secrets.yml
+  tasks:
+    - name: Configure two filtered replication channels
+      ansible.builtin.copy:
+        dest: /etc/mysql/mariadb.conf.d/60-lab.cnf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [mariadb]
+          bind_address=0.0.0.0
+          skip_name_resolve=1
+          server_id={{ mariadb_server_id }}
+          gtid_domain_id={{ gtid_domain_id }}
+          log_bin=/var/lib/mysql/mariadb-bin
+          relay_log=/var/lib/mysql/mariadb-relay
+          binlog_format=ROW
+          log_slave_updates=1
+          gtid_strict_mode=1
+          read_only=1
+          binlog_expire_logs_seconds=604800
+          innodb_buffer_pool_size=256M
+          max_connections=100
+          # wild_do_table also filters DDL by the table's real database, not the session's USE.
+          main.replicate_wild_do_table=lab.%
+          orders.replicate_wild_do_table=orders.%
+      notify: Restart MariaDB
+
+    - name: Apply settings
+      ansible.builtin.meta: flush_handlers
+
+    - name: Install the warehouse seeder
+      ansible.builtin.copy:
+        src: files/seed_warehouse.py
+        dest: /usr/local/sbin/lab-seed-warehouse
+        mode: "0700"
+
+    - name: Seed a fresh warehouse, or start its existing channels
+      ansible.builtin.command: /usr/bin/python3 /usr/local/sbin/lab-seed-warehouse
+      environment:
+        PRIMARY_HOST: "{{ hostvars['primary'].ansible_host }}"
+        ORDERS_HOST: "{{ hostvars['orders-primary'].ansible_host }}"
+        LAB_REPL_PASSWORD: "{{ lab_repl_password }}"
+      register: warehouse_seed
+      changed_when: "warehouse_seed.stdout | trim == 'CHANGED'"
+
+    - name: Report the seed
+      ansible.builtin.debug:
+        msg: "{{ warehouse_seed.stderr_lines }}"
+      when: warehouse_seed.changed
+
+    - name: Wait for both channels to run with no lag
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SHOW ALL SLAVES STATUS
+      register: warehouse_channels
+      vars:
+        channels: "{{ warehouse_channels.query_result[0] | default([]) }}"
+      until:
+        - channels | length == 2
+        - channels | map(attribute='Slave_IO_Running') | unique == ['Yes']
+        - channels | map(attribute='Slave_SQL_Running') | unique == ['Yes']
+        - channels | map(attribute='Seconds_Behind_Master') | select('none') | list | length == 0
+        - channels | map(attribute='Seconds_Behind_Master') | map('int') | max == 0
+      retries: 60
+      delay: 5
+
+    - name: Wait for this build's marker from the main primary
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT COUNT(*) AS marker_count FROM lab.pipeline_checks WHERE marker = %s
+        positional_args:
+          - "{{ lab_test_marker }}"
+      register: warehouse_marker
+      until: warehouse_marker.query_result[0][0].marker_count | int == 1
+      retries: 30
+      delay: 2
+
+    - name: Read the newest replicated order
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT COALESCE(MAX(id), 0) AS newest FROM orders.orders
+      register: orders_before
+
+    - name: Confirm new orders keep arriving from orders-primary
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query: SELECT COALESCE(MAX(id), 0) AS newest FROM orders.orders
+      register: orders_after
+      until: orders_after.query_result[0][0].newest | int > orders_before.query_result[0][0].newest | int
+      retries: 12
+      delay: 5
+
+    - name: Report multi-source health
+      ansible.builtin.debug:
+        msg: >-
+          warehouse: channels main and orders running with no lag; build marker present;
+          newest order id {{ orders_after.query_result[0][0].newest }}.
+
+  handlers:
+    - name: Restart MariaDB
+      ansible.builtin.systemd_service:
+        name: mariadb
+        state: restarted

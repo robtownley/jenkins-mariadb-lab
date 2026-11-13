@@ -1,6 +1,6 @@
 ---
 - name: Install local database health endpoints
-  hosts: database
+  hosts: database:multisource
   become: true
   tasks:
     - name: Install health endpoint
@@ -66,7 +66,7 @@
         mode: '0644'
         content: |
           [
-          {% for node in groups['database'] + groups['proxy'] %}
+          {% for node in groups['database'] + groups['multisource'] + groups['proxy'] %}
           {{ {'name': node, 'role': hostvars[node].lab_role, 'ip': hostvars[node].ansible_host, 'upstream': (hostvars[node].replication_upstream | default(''))} | to_json }}{{ ',' if not loop.last else '' }}
           {% endfor %}
           ]

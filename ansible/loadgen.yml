@@ -1,0 +1,211 @@
+---
+# Load generators. Tags:
+#   setup  install sysbench and create the sbtest tables (APPLY with LOADGEN_COUNT > 0)
+#   run    run load_profile for load_minutes and report per-replica lag (ACTION=LOAD_TEST)
+
+- name: Check there is something to generate load from
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [setup, run]
+  tasks:
+    - name: Require at least one load generator
+      ansible.builtin.assert:
+        that: groups['loadgen'] | length > 0
+        fail_msg: Set LOADGEN_COUNT to 1 or 2 and APPLY before running LOAD_TEST.
+
+- name: Give the application account a benchmark schema
+  hosts: primary
+  become: true
+  any_errors_fatal: true
+  tags: [setup]
+  tasks:
+    - name: Create sbtest and allow lab_app to build its tables
+      community.mysql.mysql_query:
+        login_unix_socket: /run/mysqld/mysqld.sock
+        query:
+          - CREATE DATABASE IF NOT EXISTS sbtest
+          - "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER ON sbtest.* TO 'lab_app'@'%'"
+
+- name: Install sysbench on the load generators
+  hosts: loadgen
+  become: true
+  any_errors_fatal: true
+  tags: [setup]
+  tasks:
+    - name: Install sysbench and the MariaDB client
+      ansible.builtin.apt:
+        name: [sysbench, mariadb-client]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 300
+
+    - name: Install the load runner
+      ansible.builtin.copy:
+        src: files/lab_load.sh
+        dest: /usr/local/sbin/lab-load
+        mode: "0755"
+
+    - name: Store the proxy address and application password for the runner
+      ansible.builtin.copy:
+        dest: /etc/lab-load.env
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          MAXSCALE_HOST={{ hostvars['maxscale'].ansible_host }}
+          LAB_APP_PASSWORD='{{ lookup('ansible.builtin.env', 'LAB_APP_PASSWORD') }}'
+      no_log: true
+
+    - name: Count existing benchmark tables
+      ansible.builtin.command:
+        argv: [mariadb, -h, "{{ hostvars['maxscale'].ansible_host }}", -u, lab_app, -N, -B, -e,
+               "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'sbtest'"]
+      environment:
+        MYSQL_PWD: "{{ lookup('ansible.builtin.env', 'LAB_APP_PASSWORD') }}"
+      register: sbtest_tables
+      changed_when: false
+      run_once: true
+
+    - name: Create the benchmark tables once (4 x 100k rows)
+      ansible.builtin.command: /usr/local/sbin/lab-load prepare 0
+      when: sbtest_tables.stdout | trim | int == 0
+      run_once: true
+
+- name: Check database disks have room for the binlogs a load test writes
+  hosts: database
+  become: true
+  any_errors_fatal: true
+  tags: [run]
+  tasks:
+    - name: Read ZFS pool usage
+      ansible.builtin.command: zpool list -H -o capacity data
+      register: pool_capacity
+      changed_when: false
+
+    - name: Refuse to load a pool that is already 70% full
+      ansible.builtin.assert:
+        that: pool_capacity.stdout | trim | replace('%', '') | int < 70
+        fail_msg: "{{ inventory_hostname }}'s data pool is {{ pool_capacity.stdout | trim }} full; free space before a load test."
+
+- name: Start the load
+  hosts: loadgen
+  become: true
+  any_errors_fatal: true
+  tags: [run]
+  tasks:
+    - name: Check the requested load
+      ansible.builtin.assert:
+        that:
+          - load_profile in ['light', 'heavy', 'spiky', 'read_only']
+          - load_minutes | int >= 1
+          - load_minutes | int <= 30
+      run_once: true
+
+    - name: Clear any previous run
+      ansible.builtin.shell: |
+        systemctl stop lab-load 2>/dev/null || true
+        systemctl reset-failed lab-load 2>/dev/null || true
+        : > /var/log/lab-load.log
+      changed_when: false
+
+    - name: Start sysbench in the background
+      ansible.builtin.command:
+        argv: [systemd-run, --unit=lab-load, -p, "StandardOutput=append:/var/log/lab-load.log",
+               -p, "StandardError=append:/var/log/lab-load.log",
+               /usr/local/sbin/lab-load, "{{ load_profile }}", "{{ load_minutes }}"]
+
+- name: Measure replication lag while the load runs
+  hosts: replicas:warehouse_nodes
+  become: true
+  tags: [run]
+  tasks:
+    - name: Install the lag sampler
+      ansible.builtin.copy:
+        src: files/lab_lag_sample.py
+        dest: /usr/local/sbin/lab-lag-sample
+        mode: "0755"
+
+    - name: Sample every 5 seconds for the whole run
+      ansible.builtin.command: /usr/bin/python3 /usr/local/sbin/lab-lag-sample {{ (load_minutes | int) * 60 + 30 }} 5
+      async: "{{ (load_minutes | int) * 60 + 300 }}"
+      poll: 15
+      register: lag_sample
+      changed_when: false
+
+    - name: Keep the summary for the report
+      ansible.builtin.set_fact:
+        lag_summary: "{{ lag_sample.stdout | from_json }}"
+
+- name: Collect sysbench results
+  hosts: loadgen
+  become: true
+  tags: [run]
+  tasks:
+    - name: Wait for sysbench to finish
+      ansible.builtin.command: systemctl is-active lab-load
+      register: load_state
+      changed_when: false
+      failed_when: false
+      until: load_state.stdout | trim not in ['active', 'activating']
+      retries: 60
+      delay: 10
+
+    - name: Read the run result
+      ansible.builtin.command: systemctl show -p Result --value lab-load
+      register: load_result
+      changed_when: false
+
+    - name: Read the sysbench summary
+      ansible.builtin.shell: grep -E 'transactions:|queries:|ignored errors:|avg:|95th percentile:|max:' /var/log/lab-load.log | tail -n 30
+      register: load_summary
+      changed_when: false
+      failed_when: false
+
+- name: Record where MaxScale sent the traffic
+  hosts: proxy
+  become: true
+  tags: [run]
+  tasks:
+    - name: List backend servers and their connections
+      ansible.builtin.command: maxctrl --tsv list servers
+      register: maxscale_servers
+      changed_when: false
+
+- name: Write the load test report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [run]
+  tasks:
+    - name: Write load_test-report.txt
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../load_test-report.txt"
+        mode: "0644"
+        content: |
+          Load test: {{ load_profile }} for {{ load_minutes }} minutes through MaxScale
+
+          Replication lag during the run (max seconds behind upstream; broken = samples with a stopped channel):
+          {% for node in groups['replicas'] + groups['warehouse_nodes'] %}
+          {% set summary = hostvars[node].lag_summary | default({}) %}
+          {% for name, stats in (summary.channels | default({})).items() %}
+            {{ '%-18s' | format(node) }} {{ '%-8s' | format(name) }} max {{ stats.max_lag }}s, last {{ stats.last_lag }}s, broken {{ stats.broken_samples }}/{{ summary.samples }}
+          {% else %}
+            {{ '%-18s' | format(node) }} no channel data
+          {% endfor %}
+          {% endfor %}
+
+          {% for node in groups['loadgen'] %}
+          {{ node }} (result: {{ hostvars[node].load_result.stdout | default('unknown') }}):
+          {{ hostvars[node].load_summary.stdout | default('no sysbench output') | indent(2, true) }}
+          {% endfor %}
+
+          MaxScale backends after the run:
+          {{ hostvars['maxscale'].maxscale_servers.stdout | default('') | indent(2, true) }}
+
+    - name: Fail if sysbench failed
+      ansible.builtin.assert:
+        that: hostvars[item].load_result.stdout | default('') == 'success'
+        fail_msg: "sysbench on {{ item }} did not finish successfully; see /var/log/lab-load.log there."
+      loop: "{{ groups['loadgen'] }}"
