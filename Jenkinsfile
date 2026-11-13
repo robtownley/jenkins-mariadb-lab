@@ -20,6 +20,10 @@ pipeline {
         TF_IN_AUTOMATION = 'true'
         TF_INPUT = 'false'
         TF_VAR_replica_count = "${params.REPLICA_COUNT ?: '2'}"
+        // Survives deleteDir() so providers are not downloaded on every build.
+        TF_PLUGIN_CACHE_DIR = '/var/lib/jenkins/.terraform.d/plugin-cache'
+        // The lock file is regenerated each build (it is not committed), so allow the cache to be used for it.
+        TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE = 'true'
     }
 
     stages {
@@ -50,15 +54,20 @@ pipeline {
                 dir('terraform') {
                     sh '''
                         set -eu
+                        mkdir -p "$TF_PLUGIN_CACHE_DIR"
                         terraform init -no-color
-                        terraform fmt
+                        terraform fmt -check -diff -recursive -no-color
                         terraform validate -no-color
                     '''
                 }
                 sh '''
                     set -eu
-                    /opt/jenkins-mariadb-venv/bin/ansible-playbook \
-                        -i 'localhost,' ansible/configure.yml --syntax-check
+                    python3 -m unittest discover -s tests
+                    # Every playbook (files with a top-level play); included task files are checked through them.
+                    for playbook in $(grep -l '^  hosts:' ansible/*.yml); do
+                        /opt/jenkins-mariadb-venv/bin/ansible-playbook \
+                            -i 'localhost,' "$playbook" --syntax-check
+                    done
                 '''
                 archiveArtifacts(artifacts: 'terraform/.terraform.lock.hcl', fingerprint: true)
             }

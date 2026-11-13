@@ -10,3 +10,4 @@ inventory.ini
 *.key
 inventory.json
 lab-known-hosts
+.ansible-facts/
