@@ -2,10 +2,12 @@
 import argparse,json,os
 from pathlib import Path
 parser=argparse.ArgumentParser();parser.add_argument('--result',required=True);args=parser.parse_args()
-action=os.environ.get('ACTION','UNKNOWN');success=args.result=='SUCCESS';applied=Path('infrastructure-applied').exists()
+action=os.environ.get('LAB_ACTION') or os.environ.get('ACTION','UNKNOWN');success=args.result=='SUCCESS';applied=Path('infrastructure-applied').exists()
 lines=[f'MariaDB lab — {action} — {args.result}',f'Requested replica count: {os.environ.get("REPLICA_COUNT","unknown")}','']
 plan_path=Path('terraform/tfplan.json')
-if plan_path.exists():
+if action not in ('PLAN','APPLY','DESTROY'):
+    pass
+elif plan_path.exists():
     plan=json.loads(plan_path.read_text());changes=plan.get('resource_changes',[])
     lines.append('DNS changes '+('(applied)' if applied else '(planned; application not confirmed)'))
     found=False
@@ -34,13 +36,24 @@ if success and action=='APPLY':
         direct = [name for name in nodes if re.fullmatch(r'replica[1-9][0-9]*', name)]
         children = [name for name in nodes if re.fullmatch(r'(sdds|affiliate-feed|heron)[1-9][0-9]*', name)]
         lines.append(f'Database topology: 1 primary, {len(direct)} intermediate replicas, {len(children)} downstream replicas.')
+        if 'warehouse' in nodes:
+            lines.append('Multi-source: warehouse replicates lab.* from primary and orders.* from orders-primary.')
+        loadgens = [name for name in nodes if re.fullmatch(r'loadgen[0-9]+', name)]
+        if loadgens:
+            lines.append(f'Load generators: {", ".join(loadgens)} (run ACTION=LOAD_TEST).')
         lines.append(f'Active instances: {len(nodes)}')
         for name,n in nodes.items():lines.append(f'  {name}: {n["instance_id"]}; private={n["private_ip"]}; public={n.get("public_ip", "")}')
     lines.extend(['','Configuration stages completed (some tasks may already have been correct):','  Jenkins hosts, instance hostnames and SSH hopping','  MariaDB/MaxScale installation, topology configuration and verification','  Seed planning; data seeding only where required and approved','  ZFS mirrors, datadir/log/temp/redo path migration checks','  Replica replication verification','  Sanoid: 24 hourly and 1 daily snapshots per replica','  Monitoring inventory and health endpoints','  HTTPS dashboard, password authentication and certificate renewal','  Shattered Silicon Monitoring server and OS/MySQL metrics on database nodes'])
 elif success and action=='DESTROY':
     lines.extend(['','Lab resources and Terraform-managed DNS records removed.','Jenkins instance and the Route 53 hosted zone remain.','Dashboard is no longer deployed.'])
+elif success and action=='STOP':lines.extend(['','Every lab server is stopped; disks and data are kept.','The next APPLY, LOAD_TEST, DRILL, BACKUP or RESTORE_TEST starts them again (APPLY also updates DNS for their new public IPs).'])
+elif success and action in ('LOAD_TEST','DRILL','BACKUP','RESTORE_TEST','BUILD_IMAGE'):lines.extend(['',f'{action} completed; details below.'])
 elif success and action=='PLAN':lines.extend(['','Preview only: no infrastructure or configuration changes applied.'])
 else:lines.extend(['','Build failed: configuration may be partially completed. See the failed stage in console output.', 'Terraform plan was applied successfully before the later failure.' if applied else 'Terraform was skipped (CONFIG_ONLY).' if os.environ.get('CONFIG_ONLY')=='true' else 'Terraform application was not confirmed; inspect state and rerun PLAN.','Dashboard availability has not been verified by this build.'])
+# Feature actions write their own report; include it.
+report_path=Path(f'{action.lower()}-report.txt')
+if report_path.exists():lines.extend(['',report_path.read_text().rstrip()])
+if Path('instances-started').exists():lines.extend(['','Stopped servers were started at the beginning of this build.'])
 # Read actual DNS state when available; do not describe it as changes.
 if success and action=='APPLY':
     import subprocess
